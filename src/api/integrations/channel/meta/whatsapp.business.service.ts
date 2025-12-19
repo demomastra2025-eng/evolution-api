@@ -503,6 +503,8 @@ export class BusinessStartupService extends ChannelStartupService {
                   data: messageRaw,
                 });
 
+                const mediaUrl = await s3Service.getObjectUrl(fullName);
+
                 await this.prismaRepository.media.create({
                   data: {
                     messageId: createdMessage.id,
@@ -510,10 +512,9 @@ export class BusinessStartupService extends ChannelStartupService {
                     type: mediaType,
                     fileName: fullName,
                     mimetype,
+                    fileUrl: mediaUrl,
                   },
                 });
-
-                const mediaUrl = await s3Service.getObjectUrl(fullName);
 
                 messageRaw.message.mediaUrl = mediaUrl;
                 messageRaw.message.base64 = buffer.data.toString('base64');

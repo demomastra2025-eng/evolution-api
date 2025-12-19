@@ -69,6 +69,19 @@ export class N8nService extends BaseChatbotService<N8n, N8nSetting> {
         }
       }
 
+      // Handle image messages
+      if (this.isImageMessage(content) && msg) {
+        try {
+          this.logger.debug(`[N8n] Processing image for Vision description`);
+          const description = await this.openaiService.imageToText(msg, instance);
+          if (description) {
+            payload.chatInput = `[image] ${description}`;
+          }
+        } catch (err) {
+          this.logger.error(`[N8n] Failed to process image: ${err}`);
+        }
+      }
+
       const headers: Record<string, string> = {};
       if (n8n.basicAuthUser && n8n.basicAuthPass) {
         const auth = Buffer.from(`${n8n.basicAuthUser}:${n8n.basicAuthPass}`).toString('base64');

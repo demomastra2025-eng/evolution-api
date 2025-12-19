@@ -731,4 +731,92 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
 
     return response?.data?.text;
   }
+
+  /**
+   * Implementation of image-to-text description for image messages
+   */
+  public async imageToText(msg: any, instance: any): Promise<string | null> {
+    const settings = await this.prismaRepository.openaiSetting.findFirst({
+      where: {
+        instanceId: instance.instanceId,
+      },
+    });
+
+    if (!settings) {
+      this.logger.error(`OpenAI settings not found. InstanceId: ${instance.instanceId}`);
+      return null;
+    }
+
+    const creds = await this.prismaRepository.openaiCreds.findUnique({
+      where: { id: settings.openaiCredsId },
+    });
+
+    if (!creds) {
+      this.logger.error(`OpenAI credentials not found. CredsId: ${settings.openaiCredsId}`);
+      return null;
+    }
+
+    // Initialize client if needed
+    if (!this.client) {
+      this.initClient(creds.apiKey);
+    }
+
+    let imageUrl = '';
+
+    if (msg.message.mediaUrl && isURL(msg.message.mediaUrl)) {
+      imageUrl = msg.message.mediaUrl;
+    } else if (msg.message.base64) {
+      imageUrl = `data:image/jpeg;base64,${msg.message.base64}`;
+    } else {
+      // Fallback: download media
+      try {
+        const buffer = await downloadMediaMessage(
+          { key: msg.key, message: msg?.message },
+          'buffer',
+          {},
+          {
+            logger: P({ level: 'error' }) as any,
+            reuploadRequest: instance,
+          },
+        );
+        if (buffer) {
+          imageUrl = `data:image/jpeg;base64,${buffer.toString('base64')}`;
+        }
+      } catch (error) {
+        this.logger.error(`Failed to download image for vision: ${error}`);
+        return null;
+      }
+    }
+
+    if (!imageUrl) {
+      return null;
+    }
+
+    try {
+      this.logger.log('Sending image to OpenAI Vision');
+      const response = await this.client.chat.completions.create({
+        model: 'gpt-4o', // Default to a vision-capable model
+        max_tokens: 300,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Describe this image in detail.' },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: imageUrl,
+                },
+              },
+            ],
+          },
+        ],
+      });
+
+      return response.choices[0].message.content;
+    } catch (error) {
+      this.logger.error(`Error calling OpenAI Vision: ${error.message || JSON.stringify(error)}`);
+      return null;
+    }
+  }
 }

@@ -380,7 +380,7 @@ export class BaileysStartupService extends ChannelStartupService {
       qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
         this.logger.log(
           `\n{ instance: ${this.instance.name} pairingCode: ${this.instance.qrcode.pairingCode}, qrcodeCount: ${this.instance.qrcode.count} }\n` +
-            qrcode,
+          qrcode,
         ),
       );
 
@@ -975,16 +975,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRepository: Set<string> = new Set(
           chatwootImport.getRepositoryMessagesCache(instance) ??
-            (
-              await this.prismaRepository.message.findMany({
-                select: { key: true },
-                where: { instanceId: this.instanceId },
-              })
-            ).map((message) => {
-              const key = message.key as { id: string };
+          (
+            await this.prismaRepository.message.findMany({
+              select: { key: true },
+              where: { instanceId: this.instanceId },
+            })
+          ).map((message) => {
+            const key = message.key as { id: string };
 
-              return key.id;
-            }),
+            return key.id;
+          }),
         );
 
         if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
@@ -1181,6 +1181,25 @@ export class BaileysStartupService extends ChannelStartupService {
                 console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
               }
             }
+          } else if (!existingChat && !received.key.remoteJid.includes('@g.us')) {
+            // Logic to create chat if it doesn't exist (Unknown Number handling and sent-from-me)
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+              try {
+                const newChatData = {
+                  remoteJid: received.key.remoteJid,
+                  name: received.pushName || received.key.remoteJid.split('@')[0],
+                  instanceId: this.instanceId,
+                };
+
+                const createdChat = await this.prismaRepository.chat.create({ data: newChatData });
+
+                // Send the created chat with id so consumers receive a complete payload
+                this.sendDataWebhook(Events.CHATS_UPSERT, [createdChat]);
+                this.logger.log(`Created new chat for unknown number: ${received.key.remoteJid}`);
+              } catch (error) {
+                this.logger.error(`Failed to create chat for unknown number: ${error}`);
+              }
+            }
           }
 
           const messageRaw = this.prepareMessage(received);
@@ -1292,6 +1311,8 @@ export class BaileysStartupService extends ChannelStartupService {
                     );
                     await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
+                    const mediaUrl = await s3Service.getObjectUrl(fullName);
+
                     await this.prismaRepository.media.create({
                       data: {
                         messageId: msg.id,
@@ -1299,10 +1320,9 @@ export class BaileysStartupService extends ChannelStartupService {
                         type: mediaType,
                         fileName: fullName,
                         mimetype,
+                        fileUrl: mediaUrl,
                       },
                     });
-
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
 
                     messageRaw.message.mediaUrl = mediaUrl;
 
@@ -2263,18 +2283,10 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const messageRaw = this.prepareMessage(messageSent);
+      const messageForMediaProcessing = this.buildMessageForMediaPayload(messageRaw);
 
-      const isMedia =
-        messageSent?.message?.imageMessage ||
-        messageSent?.message?.videoMessage ||
-        messageSent?.message?.stickerMessage ||
-        messageSent?.message?.ptvMessage ||
-        messageSent?.message?.documentMessage ||
-        messageSent?.message?.documentWithCaptionMessage ||
-        messageSent?.message?.ptvMessage ||
-        messageSent?.message?.audioMessage;
-
-      const isVideo = messageSent?.message?.videoMessage;
+      const isMedia = this.hasValidMediaContent(messageForMediaProcessing);
+      const isVideo = !!messageForMediaProcessing.message?.videoMessage;
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && !isIntegration) {
         this.chatwootService.eventWhatsapp(
@@ -2304,15 +2316,13 @@ export class BaileysStartupService extends ChannelStartupService {
               throw new Error('Video upload is disabled.');
             }
 
-            const message: any = messageRaw;
-
             // Verificação adicional para garantir que há conteúdo de mídia real
-            const hasRealMedia = this.hasValidMediaContent(message);
+            const hasRealMedia = this.hasValidMediaContent(messageForMediaProcessing);
 
             if (!hasRealMedia) {
               this.logger.warn('Message detected as media but contains no valid media content');
             } else {
-              const media = await this.getBase64FromMediaMessage({ message }, true);
+              const media = await this.getBase64FromMediaMessage({ message: messageForMediaProcessing }, true);
 
               const { buffer, mediaType, fileName, size } = media;
 
@@ -2328,11 +2338,18 @@ export class BaileysStartupService extends ChannelStartupService {
 
               await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
-              await this.prismaRepository.media.create({
-                data: { messageId: msg.id, instanceId: this.instanceId, type: mediaType, fileName: fullName, mimetype },
-              });
-
               const mediaUrl = await s3Service.getObjectUrl(fullName);
+
+              await this.prismaRepository.media.create({
+                data: {
+                  messageId: msg.id,
+                  instanceId: this.instanceId,
+                  type: mediaType,
+                  fileName: fullName,
+                  mimetype,
+                  fileUrl: mediaUrl,
+                },
+              });
 
               messageRaw.message.mediaUrl = mediaUrl;
 
@@ -3674,7 +3691,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
 
-      const msg = m?.message ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
+      let msg = m?.message ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
 
       if (!msg) {
         throw 'Message not found';
@@ -3687,7 +3704,18 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if ('messageContextInfo' in msg.message && Object.keys(msg.message).length === 1) {
-        throw 'The message is messageContextInfo';
+        // Иногда приходят апдейты, где тело содержит только messageContextInfo (например, статусы/ACK).
+        // Пытаемся подтянуть полное сообщение из базы перед тем как падать.
+        if (m?.key) {
+          const stored = (await this.getMessage(m.key, true)) as proto.IWebMessageInfo;
+          if (stored?.message) {
+            msg = stored;
+          }
+        }
+
+        if ('messageContextInfo' in msg.message && Object.keys(msg.message).length === 1) {
+          throw 'The message is messageContextInfo';
+        }
       }
 
       let mediaMessage: any;
@@ -4492,7 +4520,7 @@ export class BaileysStartupService extends ChannelStartupService {
       pushName:
         message.pushName ||
         (message.key.fromMe
-          ? 'Você'
+          ? 'Вы'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
       status: status[message.status],
       message: this.deserializeMessageBuffers({ ...message.message }),
@@ -4535,6 +4563,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return messageRaw;
+  }
+
+  private buildMessageForMediaPayload(messageRaw: any) {
+    return {
+      ...messageRaw,
+      message: this.getInnerMediaMessage(messageRaw?.message),
+    };
+  }
+
+  private getInnerMediaMessage(message: any) {
+    if (!message) return message;
+
+    if (message.forward?.message) {
+      return message.forward.message;
+    }
+
+    if (message.ephemeralMessage?.message) {
+      return message.ephemeralMessage.message;
+    }
+
+    return message;
   }
 
   private async syncChatwootLostMessages() {
@@ -4932,7 +4981,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (!message.pushName) {
         if (messageKey.fromMe) {
-          message.pushName = 'Você';
+          message.pushName = 'Вы';
         } else if (message.contextInfo) {
           const contextInfo = message.contextInfo as { participant?: string };
           if (contextInfo.participant) {

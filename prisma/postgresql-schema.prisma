@@ -401,6 +401,7 @@ model Media {
   fileName   String    @db.VarChar(500)
   type       String    @db.VarChar(100)
   mimetype   String    @db.VarChar(100)
+  fileUrl    String?   @db.VarChar(1000)
   createdAt  DateTime? @default(now()) @db.Date
   Message    Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
   messageId  String    @unique

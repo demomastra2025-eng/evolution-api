@@ -1,35 +1,30 @@
 services:
   api:
     container_name: evolution_api
-    image: evolution/api:local
-    build: .
-    restart: always
+    command: npm run start:dev
     ports:
-      - 8080:8080
+      - "8080:8080"
     volumes:
+      # Sync source so code changes are picked up without rebuilds
+      - ./src:/evolution/src
+      - ./public:/evolution/public
+      - ./prisma:/evolution/prisma
+      - ./manager:/evolution/manager
+      - ./Docker:/evolution/Docker
+      - ./tsconfig.json:/evolution/tsconfig.json:ro
+      - ./tsup.config.ts:/evolution/tsup.config.ts:ro
+      - ./package.json:/evolution/package.json:ro
+      - ./package-lock.json:/evolution/package-lock.json:ro
+      - ./runWithProvider.js:/evolution/runWithProvider.js:ro
+      # Separate instance storage so dev and prod don’t clash
       - evolution_instances:/evolution/instances
-    networks:
-      - evolution-net
-    env_file:
-      - .env
-    expose:
-      - 8080
+    environment:
+      - NODE_ENV=development
+    restart: unless-stopped
 
   frontend:
     container_name: evolution_frontend
-    image: evolution/manager:local
-    build: ./evolution-manager-v2
-    restart: always
     ports:
       - "3000:80"
-    networks:
-      - evolution-net
-
-volumes:
-  evolution_instances:
-
-
-networks:
-  evolution-net:
-    name: evolution-net
-    driver: bridge
+    volumes:
+      - ./Docker/nginx-manager.conf:/etc/nginx/conf.d/nginx.conf:ro

@@ -155,6 +155,8 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
       // Forward the message to the chatbot API
       await this.sendMessageToBot(instance, session, settings, bot, remoteJid, pushName || '', content, msg);
 
+      await this.linkMessageToSession(msg, instance, session);
+
       // Update session to indicate we're waiting for user response
       await this.prismaRepository.integrationSession.update({
         where: {
@@ -416,4 +418,32 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
     content: string,
     msg?: any,
   ): Promise<void>;
+
+  /**
+   * Persist the link between a WhatsApp message and the chatbot session
+   */
+  private async linkMessageToSession(msg: any, instance: any, session: IntegrationSession) {
+    try {
+      const instanceId = instance?.instanceId || instance?.instance?.id;
+
+      if (!msg?.key?.id || !instanceId || !session?.id) return;
+
+      await this.prismaRepository.message.updateMany({
+        where: {
+          instanceId,
+          key: {
+            path: ['id'],
+            equals: msg.key.id,
+          },
+        },
+        data: {
+          sessionId: session.id,
+        },
+      });
+
+      msg.sessionId = session.id;
+    } catch (error) {
+      this.logger.error(`Error linking message to session: ${error}`);
+    }
+  }
 }
