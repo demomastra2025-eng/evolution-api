@@ -9,7 +9,12 @@ import { SettingsService } from '@api/services/settings.service';
 import { Events, Integration, wa } from '@api/types/wa.types';
 import { Auth, Chatwoot, ConfigService, HttpServer, WaBusiness } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import { BadRequestException, InternalServerErrorException, UnauthorizedException } from '@exceptions';
+import {
+  BadRequestException,
+  InternalServerErrorException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@exceptions';
 import { delay } from 'baileys';
 import { isArray, isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
@@ -33,6 +38,55 @@ export class InstanceController {
   ) {}
 
   private readonly logger = new Logger('InstanceController');
+
+  private async cleanupOrphanedRuntime(instanceName: string) {
+    this.logger.warn({
+      message: 'Cleaning orphaned runtime instance without persisted record',
+      instanceName,
+    });
+
+    this.waMonitor.clearDelInstanceTime(instanceName);
+
+    try {
+      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to logout orphaned runtime instance',
+        instanceName,
+        error: error?.toString(),
+      });
+    }
+
+    try {
+      await this.waMonitor.cleaningUp(instanceName);
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to clean orphaned runtime session data',
+        instanceName,
+        error: error?.toString(),
+      });
+    }
+
+    try {
+      await this.waMonitor.cleaningStoreData(instanceName);
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to clean orphaned runtime store data',
+        instanceName,
+        error: error?.toString(),
+      });
+    }
+
+    try {
+      delete this.waMonitor.waInstances[instanceName];
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to remove orphaned runtime instance from monitor',
+        instanceName,
+        error: error?.toString(),
+      });
+    }
+  }
 
   public async createInstance(instanceData: InstanceDto) {
     try {
@@ -391,10 +445,25 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    const runtimeInstance = this.waMonitor.waInstances[instanceName];
+    const persistedInstance = await this.prismaRepository.instance.findFirst({
+      where: { name: instanceName },
+      select: { id: true },
+    });
+
+    if (runtimeInstance && !persistedInstance) {
+      await this.cleanupOrphanedRuntime(instanceName);
+      throw new NotFoundException(`Instance "${instanceName}" not found`);
+    }
+
+    if (!runtimeInstance || !persistedInstance) {
+      throw new NotFoundException(`Instance "${instanceName}" not found`);
+    }
+
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: runtimeInstance.connectionStatus?.state,
       },
     };
   }

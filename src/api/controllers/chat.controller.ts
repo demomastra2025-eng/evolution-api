@@ -16,6 +16,7 @@ import {
   WhatsAppNumberDto,
 } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
+import { MediaUnavailableError } from '@api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
@@ -56,7 +57,20 @@ export class ChatController {
   }
 
   public async getBase64FromMediaMessage({ instanceName }: InstanceDto, data: getBase64FromMediaMessageDto) {
-    return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
+    try {
+      return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
+    } catch (error) {
+      if (error instanceof MediaUnavailableError) {
+        return {
+          unavailable: true,
+          reason: error.reason,
+          statusCode: error.statusCode,
+          mediaUrl: error.mediaUrl,
+        };
+      }
+
+      throw error;
+    }
   }
 
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
