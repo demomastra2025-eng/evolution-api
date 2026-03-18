@@ -317,15 +317,17 @@ export class ChatwootService {
 
       let data: any = {};
       if (!isGroup) {
+        const identifier = jid || phoneNumber;
+        const resolvedPhoneNumber = this.getPhoneNumberFromJid(jid) || (/^\d+$/.test(phoneNumber) ? phoneNumber : null);
         data = {
           inbox_id: inboxId,
-          name: name || phoneNumber,
-          identifier: jid,
+          name: name || resolvedPhoneNumber || this.normalizeJidIdentifier(identifier),
+          identifier,
           avatar_url: avatar_url,
         };
 
-        if ((jid && jid.includes('@')) || !jid) {
-          data['phone_number'] = `+${phoneNumber}`;
+        if (resolvedPhoneNumber) {
+          data['phone_number'] = `+${resolvedPhoneNumber}`;
         }
       } else {
         data = {
@@ -346,7 +348,12 @@ export class ChatwootService {
         return null;
       }
 
-      const findContact = await this.findContact(instance, phoneNumber);
+      const resolvedPhoneNumber = this.getPhoneNumberFromJid(jid) || (/^\d+$/.test(phoneNumber) ? phoneNumber : null);
+      const findContact = resolvedPhoneNumber
+        ? await this.findContact(instance, resolvedPhoneNumber)
+        : jid
+          ? await this.findContactByIdentifier(instance, this.normalizeJidIdentifier(jid))
+          : null;
 
       const contactId = findContact?.id;
 
@@ -449,13 +456,16 @@ export class ChatwootService {
       },
     })) as any;
 
-    if (contact && contact.data && contact.data.payload && contact.data.payload.length > 0) {
-      return contact.data.payload[0];
-    }
-
-    // Fallback for older API versions or different response structures
-    if (contact && contact.payload && contact.payload.length > 0) {
-      return contact.payload[0];
+    const searchPayload = contact?.data?.payload || contact?.payload || [];
+    if (searchPayload.length > 0) {
+      const normalizedIdentifier = this.normalizeJidIdentifier(identifier);
+      return (
+        searchPayload.find(
+          (contactItem: any) =>
+            contactItem?.identifier === identifier ||
+            this.normalizeJidIdentifier(contactItem?.identifier || '') === normalizedIdentifier,
+        ) || searchPayload[0]
+      );
     }
 
     // Try search by attribute
@@ -616,6 +626,149 @@ export class ChatwootService {
     return ['phone_number'];
   }
 
+  private isLidJid(jid?: string | null) {
+    return !!jid && jid.includes('@lid');
+  }
+
+  private getPhoneNumberFromJid(jid?: string | null) {
+    if (!jid || this.isLidJid(jid) || jid.endsWith('@g.us')) {
+      return null;
+    }
+
+    const identifier = jid.split('@')[0].split(':')[0];
+    return /^\d+$/.test(identifier) ? identifier : null;
+  }
+
+  private extractLidCandidates(messageKey: { remoteJid?: string; remoteJidAlt?: string; remoteLid?: string }) {
+    return [
+      ...new Set(
+        [messageKey.remoteJid, messageKey.remoteJidAlt, messageKey.remoteLid].filter(
+          (jid): jid is string => !!jid && this.isLidJid(jid),
+        ),
+      ),
+    ];
+  }
+
+  private async reconcileChatwootContactIdentity(
+    instance: InstanceDto,
+    options: {
+      canonicalJid?: string | null;
+      lidCandidates?: string[];
+      name?: string | null;
+      avatarUrl?: string | null;
+    },
+  ) {
+    const canonicalJid = options.canonicalJid ?? null;
+    const canonicalPhoneNumber = this.getPhoneNumberFromJid(canonicalJid);
+    const uniqueLidCandidates = [
+      ...new Set((options.lidCandidates ?? []).map((lid) => this.normalizeJidIdentifier(lid))),
+    ];
+
+    const phoneContact = canonicalPhoneNumber ? await this.findContact(instance, canonicalPhoneNumber) : null;
+    const lidContacts = (
+      await Promise.all(uniqueLidCandidates.map((lid) => this.findContactByIdentifier(instance, lid)))
+    ).filter(Boolean);
+
+    let primaryContact = phoneContact ?? lidContacts[0] ?? null;
+
+    if (!primaryContact) {
+      return null;
+    }
+
+    if (canonicalPhoneNumber && canonicalJid) {
+      const updateData: any = {};
+
+      if (primaryContact.identifier !== canonicalJid) {
+        updateData.identifier = canonicalJid;
+      }
+
+      if (primaryContact.phone_number !== `+${canonicalPhoneNumber}`) {
+        updateData.phone_number = `+${canonicalPhoneNumber}`;
+      }
+
+      if (
+        options.name &&
+        (!primaryContact.name || primaryContact.name === this.normalizeJidIdentifier(primaryContact.identifier))
+      ) {
+        updateData.name = options.name;
+      }
+
+      if (options.avatarUrl !== undefined) {
+        updateData.avatar_url = options.avatarUrl;
+      }
+
+      if (Object.keys(updateData).length > 0) {
+        const updatedContact: any = await this.updateContact(instance, primaryContact.id, updateData);
+        if (updatedContact) {
+          primaryContact = updatedContact;
+        } else {
+          const refreshedPhoneContact = await this.findContact(instance, canonicalPhoneNumber);
+          if (refreshedPhoneContact) {
+            primaryContact = refreshedPhoneContact;
+          }
+        }
+      }
+
+      for (const lidContact of lidContacts) {
+        if (lidContact.id !== primaryContact.id) {
+          await this.mergeContacts(primaryContact.id, lidContact.id);
+        }
+      }
+
+      return primaryContact;
+    }
+
+    const updateData: any = {};
+
+    if (
+      options.name &&
+      (!primaryContact.name || primaryContact.name === this.normalizeJidIdentifier(primaryContact.identifier))
+    ) {
+      updateData.name = options.name;
+    }
+
+    if (options.avatarUrl !== undefined) {
+      updateData.avatar_url = options.avatarUrl;
+    }
+
+    if (Object.keys(updateData).length > 0) {
+      const updatedContact: any = await this.updateContact(instance, primaryContact.id, updateData);
+      primaryContact = updatedContact ?? primaryContact;
+    }
+
+    return primaryContact;
+  }
+
+  public async reconcileContactIdentity(
+    instance: InstanceDto,
+    body: {
+      remoteJid?: string | null;
+      remoteJidAlt?: string | null;
+      remoteLid?: string | null;
+      pushName?: string | null;
+      profilePicUrl?: string | null;
+    },
+  ) {
+    const lidCandidates = this.extractLidCandidates({
+      remoteJid: body.remoteJid ?? undefined,
+      remoteJidAlt: body.remoteJidAlt ?? undefined,
+      remoteLid: body.remoteLid ?? undefined,
+    });
+    const canonicalJid =
+      [body.remoteJid, body.remoteJidAlt].find((jid) => jid && !this.isLidJid(jid)) ?? body.remoteJid ?? null;
+
+    if (canonicalJid && !this.isLidJid(canonicalJid)) {
+      lidCandidates.forEach((lid) => this.saveLidMapping(lid, canonicalJid));
+    }
+
+    return this.reconcileChatwootContactIdentity(instance, {
+      canonicalJid,
+      lidCandidates,
+      name: body.pushName,
+      avatarUrl: body.profilePicUrl ?? null,
+    });
+  }
+
   private getFilterPayload(query: string) {
     const filterPayload = [];
 
@@ -638,62 +791,41 @@ export class ChatwootService {
   }
 
   public async createConversation(instance: InstanceDto, body: any) {
-    const isLid = body.key.addressingMode === 'lid';
-    const isGroup = body.key.remoteJid.endsWith('@g.us');
-    let phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
-    let { remoteJid } = body.key;
+    const { key } = body;
+    const remoteJid = key.remoteJid;
+    const isGroup = remoteJid.endsWith('@g.us');
+    const isLid = key.addressingMode === 'lid' || this.isLidJid(remoteJid);
+    const lidCandidates = isGroup ? [] : this.extractLidCandidates(key);
+    let conversationJid = remoteJid;
 
-    // CORREÇÃO LID: Resolve LID para número normal antes de processar
     if (isLid && !isGroup) {
-      const resolvedPhone = await this.resolveLidToPhone(instance, body.key);
-      
+      const resolvedPhone = await this.resolveLidToPhone(instance, key);
+
       if (resolvedPhone && resolvedPhone !== remoteJid) {
         this.logger.verbose(`LID detected and resolved: ${remoteJid} → ${resolvedPhone}`);
-        phoneNumber = resolvedPhone;
-        
-        // Salva mapeamento se temos remoteJidAlt
-        if (body.key.remoteJidAlt) {
-          this.saveLidMapping(remoteJid, body.key.remoteJidAlt);
-        }
-      } else if (body.key.remoteJidAlt) {
-        // Se não resolveu mas tem remoteJidAlt, usa ele
-        phoneNumber = body.key.remoteJidAlt;
-        this.saveLidMapping(remoteJid, body.key.remoteJidAlt);
-        this.logger.verbose(`Using remoteJidAlt for LID: ${remoteJid} → ${phoneNumber}`);
+        conversationJid = resolvedPhone;
+      } else if (key.remoteJidAlt && !this.isLidJid(key.remoteJidAlt)) {
+        conversationJid = key.remoteJidAlt;
+        this.logger.verbose(`Using remoteJidAlt for LID: ${remoteJid} → ${conversationJid}`);
+      } else {
+        this.logger.verbose(`LID detected without canonical JID yet: ${remoteJid}`);
       }
     }
 
-    // Usa phoneNumber como base para cache (não o LID)
-    const cacheKey = `${instance.instanceName}:createConversation-${phoneNumber}`;
-    const lockKey = `${instance.instanceName}:lock:createConversation-${phoneNumber}`;
+    if (!isGroup && !this.isLidJid(conversationJid)) {
+      lidCandidates.forEach((lid) => this.saveLidMapping(lid, conversationJid));
+    }
+
+    const phoneNumber = !isGroup ? this.getPhoneNumberFromJid(conversationJid) : null;
+    const contactLookupKey = isGroup ? remoteJid : phoneNumber || this.normalizeJidIdentifier(conversationJid);
+    const cacheIdentity = isGroup ? remoteJid : conversationJid;
+    const cacheKey = `${instance.instanceName}:createConversation-${cacheIdentity}`;
+    const lockKey = `${instance.instanceName}:lock:createConversation-${cacheIdentity}`;
     const maxWaitTime = 5000; // 5 seconds
     const client = await this.clientCw(instance);
     if (!client) return null;
 
     try {
-      // Processa atualização de contatos já criados @lid
-      if (phoneNumber && remoteJid && !isGroup) {
-        const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
-        if (contact && contact.identifier !== remoteJid) {
-          this.logger.verbose(
-            `Identifier needs update: (contact.identifier: ${contact.identifier}, phoneNumber: ${phoneNumber}, body.key.remoteJidAlt: ${remoteJid}`,
-          );
-          const updateContact = await this.updateContact(instance, contact.id, {
-            identifier: phoneNumber,
-            phone_number: `+${phoneNumber.split('@')[0]}`,
-          });
-
-          if (updateContact === null) {
-            const baseContact = await this.findContact(instance, phoneNumber.split('@')[0]);
-            if (baseContact) {
-              await this.mergeContacts(baseContact.id, contact.id);
-              this.logger.verbose(
-                `Merge contacts: (${baseContact.id}) ${baseContact.phone_number} and (${contact.id}) ${contact.phone_number}`,
-              );
-            }
-          }
-        }
-      }
       this.logger.verbose(`--- Start createConversation ---`);
       this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
 
@@ -753,7 +885,7 @@ export class ChatwootService {
           return (await this.cache.get(cacheKey)) as number;
         }
 
-        const chatId = isGroup ? remoteJid : phoneNumber.split('@')[0].split(':')[0];
+        const chatId = isGroup ? remoteJid : contactLookupKey;
         let nameContact = !body.key.fromMe ? body.pushName : chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;
@@ -763,15 +895,18 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
+          const participantJid =
+            isLid && !body.key.fromMe && body.key.participantAlt ? body.key.participantAlt : body.key.participant;
+          const participantPhoneNumber = this.getPhoneNumberFromJid(participantJid);
+          const participantLookupKey = participantPhoneNumber || this.normalizeJidIdentifier(participantJid);
           nameContact = `${group.subject} (GROUP)`;
 
-          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
-            participantJid.split('@')[0],
-          );
+          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
           this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
 
-          const findParticipant = await this.findContact(instance, participantJid.split('@')[0]);
+          const findParticipant = participantPhoneNumber
+            ? await this.findContact(instance, participantPhoneNumber)
+            : await this.findContactByIdentifier(instance, participantLookupKey);
 
           if (findParticipant) {
             this.logger.verbose(
@@ -786,7 +921,7 @@ export class ChatwootService {
           } else {
             await this.createContact(
               instance,
-              participantJid.split('@')[0].split(':')[0],
+              participantPhoneNumber || participantLookupKey,
               filterInbox.id,
               false,
               body.pushName,
@@ -796,15 +931,36 @@ export class ChatwootService {
           }
         }
 
-        const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
+        const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
+          isGroup ? chatId : conversationJid,
+        );
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
-        this.logger.verbose(`Searching contact for: ${chatId}`);
-        let contact = await this.findContact(instance, chatId);
+        this.logger.verbose(`Searching contact for: ${contactLookupKey}`);
+        let contact = null;
+
+        if (!isGroup) {
+          contact = await this.reconcileChatwootContactIdentity(instance, {
+            canonicalJid: this.isLidJid(conversationJid) ? null : conversationJid,
+            lidCandidates,
+            name: !body.key.fromMe ? nameContact : null,
+            avatarUrl: !body.key.fromMe ? picture_url.profilePictureUrl || null : undefined,
+          });
+
+          if (!contact && phoneNumber) {
+            contact = await this.findContact(instance, phoneNumber);
+          }
+
+          if (!contact && this.isLidJid(conversationJid)) {
+            contact = await this.findContactByIdentifier(instance, this.normalizeJidIdentifier(conversationJid));
+          }
+        } else {
+          contact = await this.findContact(instance, chatId);
+        }
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
-          if (!body.key.fromMe) {
+          if (!body.key.fromMe && isGroup) {
             const waProfilePictureFile =
               picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
             const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
@@ -823,12 +979,12 @@ export class ChatwootService {
         } else {
           contact = await this.createContact(
             instance,
-            chatId,
+            phoneNumber || chatId,
             filterInbox.id,
             isGroup,
             nameContact,
             picture_url.profilePictureUrl || null,
-            phoneNumber,
+            isGroup ? remoteJid : conversationJid,
           );
         }
 
@@ -974,9 +1130,7 @@ export class ChatwootService {
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     // Filtra valores null/undefined do content_attributes para evitar erro 406
-    const filteredReplyToIds = Object.fromEntries(
-      Object.entries(replyToIds).filter(([_, value]) => value != null)
-    );
+    const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
 
     // Monta o objeto data, incluindo content_attributes apenas se houver dados válidos
     const messageData: any = {
@@ -1132,9 +1286,7 @@ export class ChatwootService {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
 
       // Filtra valores null/undefined antes de enviar
-      const filteredReplyToIds = Object.fromEntries(
-        Object.entries(replyToIds).filter(([_, value]) => value != null)
-      );
+      const filteredReplyToIds = Object.fromEntries(Object.entries(replyToIds).filter(([, value]) => value != null));
 
       if (Object.keys(filteredReplyToIds).length > 0) {
         const contentAttrs = JSON.stringify(filteredReplyToIds);
@@ -1841,32 +1993,32 @@ export class ChatwootService {
   }
 
   private getTypeMessage(msg: any) {
-  const types = {
-    conversation: msg.conversation,
-    imageMessage: msg.imageMessage?.caption,
-    videoMessage: msg.videoMessage?.caption,
-    extendedTextMessage: msg.extendedTextMessage?.text,
-    messageContextInfo: msg.messageContextInfo?.stanzaId,
-    stickerMessage: undefined,
-    documentMessage: msg.documentMessage?.caption,
-    documentWithCaptionMessage: msg.documentWithCaptionMessage?.message?.documentMessage?.caption,
-    audioMessage: msg.audioMessage ? (msg.audioMessage.caption ?? '') : undefined,
-    contactMessage: msg.contactMessage?.vcard,
-    contactsArrayMessage: msg.contactsArrayMessage,
-    locationMessage: msg.locationMessage,
-    liveLocationMessage: msg.liveLocationMessage,
-    listMessage: msg.listMessage,
-    listResponseMessage: msg.listResponseMessage,
-    orderMessage: msg.orderMessage,
-    quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
-    viewOnceMessageV2:
-      msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
-      msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
-      msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
-  };
+    const types = {
+      conversation: msg.conversation,
+      imageMessage: msg.imageMessage?.caption,
+      videoMessage: msg.videoMessage?.caption,
+      extendedTextMessage: msg.extendedTextMessage?.text,
+      messageContextInfo: msg.messageContextInfo?.stanzaId,
+      stickerMessage: undefined,
+      documentMessage: msg.documentMessage?.caption,
+      documentWithCaptionMessage: msg.documentWithCaptionMessage?.message?.documentMessage?.caption,
+      audioMessage: msg.audioMessage ? (msg.audioMessage.caption ?? '') : undefined,
+      contactMessage: msg.contactMessage?.vcard,
+      contactsArrayMessage: msg.contactsArrayMessage,
+      locationMessage: msg.locationMessage,
+      liveLocationMessage: msg.liveLocationMessage,
+      listMessage: msg.listMessage,
+      listResponseMessage: msg.listResponseMessage,
+      orderMessage: msg.orderMessage,
+      quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
+      viewOnceMessageV2:
+        msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
+        msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
+    };
 
-  return types;
-}
+    return types;
+  }
 
   private getMessageContent(types: any) {
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined);
@@ -1894,39 +2046,39 @@ export class ChatwootService {
       this.processedOrderIds.set(result.orderId, now);
     }
     // Tratamento de Produto citado (WhatsApp Desktop)
-if (typeKey === 'quotedProductMessage' && result?.product) {
-  const product = result.product;
-  
-  // Extrai preço
-  let rawPrice = 0;
-  const amount = product.priceAmount1000;
+    if (typeKey === 'quotedProductMessage' && result?.product) {
+      const product = result.product;
 
-  if (Long.isLong(amount)) {
-    rawPrice = amount.toNumber();
-  } else if (amount && typeof amount === 'object' && 'low' in amount) {
-    rawPrice = Long.fromValue(amount).toNumber();
-  } else if (typeof amount === 'number') {
-    rawPrice = amount;
-  }
+      // Extrai preço
+      let rawPrice = 0;
+      const amount = product.priceAmount1000;
 
-  const price = (rawPrice / 1000).toLocaleString('pt-BR', {
-    style: 'currency',
-    currency: product.currencyCode || 'BRL',
-  });
+      if (Long.isLong(amount)) {
+        rawPrice = amount.toNumber();
+      } else if (amount && typeof amount === 'object' && 'low' in amount) {
+        rawPrice = Long.fromValue(amount).toNumber();
+      } else if (typeof amount === 'number') {
+        rawPrice = amount;
+      }
 
-  const productTitle = product.title || 'Produto do catálogo';
-  const productId = product.productId || 'N/A';
+      const price = (rawPrice / 1000).toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: product.currencyCode || 'BRL',
+      });
 
-  return (
-    `🛒 *PRODUTO DO CATÁLOGO (Desktop)*\n` +
-    `━━━━━━━━━━━━━━━━━━━━━\n` +
-    `📦 *Produto:* ${productTitle}\n` +
-    `💰 *Preço:* ${price}\n` +
-    `🆔 *Código:* ${productId}\n` +
-    `━━━━━━━━━━━━━━━━━━━━━\n` +
-    `_Cliente perguntou: "${types.conversation || 'Me envia este produto?'}"_`
-  );
-}
+      const productTitle = product.title || 'Produto do catálogo';
+      const productId = product.productId || 'N/A';
+
+      return (
+        `🛒 *PRODUTO DO CATÁLOGO (Desktop)*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📦 *Produto:* ${productTitle}\n` +
+        `💰 *Preço:* ${price}\n` +
+        `🆔 *Código:* ${productId}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━\n` +
+        `_Cliente perguntou: "${types.conversation || 'Me envia este produto?'}"_`
+      );
+    }
     if (typeKey === 'orderMessage') {
       // Extrai o valor - pode ser Long, objeto {low, high}, ou número direto
       let rawPrice = 0;
@@ -2162,15 +2314,40 @@ if (typeKey === 'quotedProductMessage' && result?.product) {
         }
       }
 
+      if (
+        event === Events.CONTACTS_UPDATE ||
+        event === Events.CONTACTS_UPSERT ||
+        event === 'contacts.update' ||
+        event === 'contacts.upsert'
+      ) {
+        const contacts = Array.isArray(body) ? body : [body];
+
+        for (const contact of contacts) {
+          if (!contact?.remoteJid || contact.remoteJid.endsWith('@g.us')) {
+            continue;
+          }
+
+          await this.reconcileContactIdentity(instance, {
+            remoteJid: contact.remoteJid,
+            remoteJidAlt: contact.remoteJidAlt,
+            remoteLid: contact.remoteLid,
+            pushName: contact.pushName,
+            profilePicUrl: contact.profilePicUrl,
+          });
+        }
+
+        return;
+      }
+
       // CORREÇÃO LID: Resolve LID para número normal antes de processar evento
       if (body?.key?.remoteJid && body.key.remoteJid.includes('@lid') && !body.key.remoteJid.endsWith('@g.us')) {
         const originalJid = body.key.remoteJid;
         const resolvedPhone = await this.resolveLidToPhone(instance, body.key);
-        
+
         if (resolvedPhone && resolvedPhone !== originalJid) {
           this.logger.verbose(`Event LID resolved: ${originalJid} → ${resolvedPhone}`);
           body.key.remoteJid = resolvedPhone;
-          
+
           // Salva mapeamento se temos remoteJidAlt
           if (body.key.remoteJidAlt) {
             this.saveLidMapping(originalJid, body.key.remoteJidAlt);
@@ -2748,13 +2925,13 @@ if (typeKey === 'quotedProductMessage' && result?.product) {
     if (!lid || !phoneNumber || !lid.includes('@lid')) {
       return;
     }
-    
+
     this.cleanLidCache();
     this.lidToPhoneMap.set(lid, {
       phone: phoneNumber,
       timestamp: Date.now(),
     });
-    
+
     this.logger.verbose(`LID mapping saved: ${lid} → ${phoneNumber}`);
   }
 
@@ -2764,7 +2941,7 @@ if (typeKey === 'quotedProductMessage' && result?.product) {
    */
   private async resolveLidToPhone(instance: InstanceDto, messageKey: any): Promise<string | null> {
     const { remoteJid, remoteJidAlt } = messageKey;
-    
+
     // Se não for LID, retorna o próprio remoteJid
     if (!remoteJid || !remoteJid.includes('@lid')) {
       return remoteJid;
@@ -2788,7 +2965,7 @@ if (typeKey === 'quotedProductMessage' && result?.product) {
     try {
       const lidIdentifier = this.normalizeJidIdentifier(remoteJid);
       const contact = await this.findContactByIdentifier(instance, lidIdentifier);
-      
+
       if (contact && contact.phone_number) {
         // Converte +554498860240 → 554498860240@s.whatsapp.net
         const phoneNumber = contact.phone_number.replace('+', '') + '@s.whatsapp.net';

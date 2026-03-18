@@ -78,7 +78,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message, Prisma } from '@prisma/client';
+import { Contact as ContactModel, Instance, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
@@ -330,13 +330,154 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.stateConnection;
   }
 
+  private trimToUndefined(value?: string | null): string | undefined {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
   private normalizeJid(jid?: string | null): string | undefined {
-    const value = jid?.replace(/:.*$/, '').trim();
-    return value || undefined;
+    const value = jid?.trim();
+    if (!value) {
+      return undefined;
+    }
+
+    const atIndex = value.indexOf('@');
+    if (atIndex === -1) {
+      return value.replace(/:\d+$/, '') || undefined;
+    }
+
+    const user = value.slice(0, atIndex).replace(/:\d+$/, '');
+    const server = value.slice(atIndex + 1);
+    const normalized = `${user}@${server}`;
+
+    return normalized || undefined;
   }
 
   private isLidJid(jid?: string | null): boolean {
     return !!this.normalizeJid(jid)?.includes('@lid');
+  }
+
+  private pickPreferredName(...values: Array<string | null | undefined>) {
+    for (const value of values) {
+      const preferred = this.trimToUndefined(value);
+      if (preferred) {
+        return preferred;
+      }
+    }
+
+    return undefined;
+  }
+
+  private uniqueNormalizedJids(...jids: Array<string | null | undefined>) {
+    return [...new Set(jids.map((jid) => this.normalizeJid(jid)).filter((jid): jid is string => !!jid))];
+  }
+
+  private buildIdentityCandidates(
+    resolution: Partial<CanonicalJidResolution> = {},
+    ...extraJids: Array<string | null | undefined>
+  ) {
+    return this.uniqueNormalizedJids(
+      resolution.remoteJid,
+      resolution.remoteJidAlt,
+      resolution.remoteLid,
+      resolution.rawRemoteJid,
+      ...extraJids,
+    );
+  }
+
+  private async resolveLidToPnJid(jid?: string | null): Promise<string | undefined> {
+    const normalizedJid = this.normalizeJid(jid);
+
+    if (!normalizedJid || !this.isLidJid(normalizedJid) || !this.client?.signalRepository?.lidMapping?.getPNForLID) {
+      return undefined;
+    }
+
+    try {
+      const mappedJid = await this.client.signalRepository.lidMapping.getPNForLID(normalizedJid);
+      const normalizedMappedJid = this.normalizeJid(mappedJid);
+
+      if (normalizedMappedJid && !this.isLidJid(normalizedMappedJid)) {
+        return normalizedMappedJid;
+      }
+    } catch (error) {
+      this.logger.debug({
+        message: 'Failed to resolve LID to PN using native Baileys mapping',
+        inputJid: normalizedJid,
+        error: error?.toString?.() ?? String(error),
+      });
+    }
+
+    return undefined;
+  }
+
+  private async resolveCanonicalJidWithNative(
+    remoteJid?: string | null,
+    remoteJidAlt?: string | null,
+    options: { phoneNumber?: string | null; remoteLid?: string | null } = {},
+  ): Promise<CanonicalJidResolution> {
+    const resolution = this.resolveCanonicalJid(remoteJid, remoteJidAlt, options);
+
+    if (resolution.remoteJid && !this.isLidJid(resolution.remoteJid)) {
+      return resolution;
+    }
+
+    const lidCandidates = this.uniqueNormalizedJids(options.remoteLid, remoteJid, remoteJidAlt).filter((jid) =>
+      this.isLidJid(jid),
+    );
+
+    for (const lidJid of lidCandidates) {
+      const pnJid = await this.resolveLidToPnJid(lidJid);
+
+      if (pnJid) {
+        return this.resolveCanonicalJid(pnJid, lidJid, {
+          phoneNumber: options.phoneNumber,
+          remoteLid: lidJid,
+        });
+      }
+    }
+
+    return resolution;
+  }
+
+  private async findBestContactByJids(jids: Array<string | null | undefined>) {
+    const candidates = this.uniqueNormalizedJids(...jids);
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    const contacts = await this.prismaRepository.contact.findMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: candidates } },
+    });
+
+    const contactByJid = new Map<string, (typeof contacts)[number]>(
+      contacts.map((contact) => [contact.remoteJid, contact] as const),
+    );
+
+    for (const candidate of candidates) {
+      const contact = contactByJid.get(candidate);
+      if (contact) {
+        return contact;
+      }
+    }
+
+    return contacts[0] ?? null;
+  }
+
+  private async resolveProfilePictureUrlForIdentity(
+    resolution: Partial<CanonicalJidResolution> = {},
+    ...extraJids: Array<string | null | undefined>
+  ) {
+    const candidates = this.buildIdentityCandidates(resolution, ...extraJids);
+
+    for (const candidate of candidates) {
+      const picture = await this.profilePicture(candidate);
+      if (picture.profilePictureUrl) {
+        return picture.profilePictureUrl;
+      }
+    }
+
+    return null;
   }
 
   private resolveCanonicalJid(
@@ -410,10 +551,44 @@ export class BaileysStartupService extends ChannelStartupService {
     return key;
   }
 
-  private normalizeContactPayload(contact: Partial<Contact> & { id?: string; phoneNumber?: string | null }) {
-    const resolution = this.resolveCanonicalJid(contact.id, (contact as any)?.remoteJidAlt, {
+  private async applyCanonicalKeyIdentityWithNative(
+    key: Partial<ExtendedIMessageKey> | undefined,
+    options: { phoneNumber?: string | null; remoteLid?: string | null } = {},
+  ) {
+    if (!key) {
+      return key;
+    }
+
+    const resolution = await this.resolveCanonicalJidWithNative(key.remoteJid, key.remoteJidAlt, {
+      phoneNumber: options.phoneNumber,
+      remoteLid: options.remoteLid ?? (key as any).remoteLid,
+    });
+
+    if (resolution.remoteJid) {
+      key.remoteJid = resolution.remoteJid;
+    }
+    if (resolution.remoteJidAlt) {
+      key.remoteJidAlt = resolution.remoteJidAlt;
+    } else {
+      delete key.remoteJidAlt;
+    }
+    if (resolution.remoteLid) {
+      (key as any).remoteLid = resolution.remoteLid;
+    }
+    if (resolution.addressingMode) {
+      (key as any).addressingMode = resolution.addressingMode;
+    }
+    if (key.participant) {
+      key.participant = this.normalizeJid(key.participant);
+    }
+
+    return key;
+  }
+
+  private async normalizeContactPayload(contact: Partial<Contact> & { id?: string; phoneNumber?: string | null }) {
+    const resolution = await this.resolveCanonicalJidWithNative(contact.id, (contact as any)?.remoteJidAlt, {
       phoneNumber: contact.phoneNumber,
-      remoteLid: (contact as any)?.remoteLid,
+      remoteLid: (contact as any)?.remoteLid ?? (contact as any)?.lid,
     });
     const remoteJid = resolution.remoteJid;
 
@@ -428,18 +603,23 @@ export class BaileysStartupService extends ChannelStartupService {
         resolution.rawRemoteJid && resolution.rawRemoteJid !== remoteJid ? resolution.rawRemoteJid : undefined,
       remoteJidAlt: resolution.remoteJidAlt,
       remoteLid: resolution.remoteLid,
-      pushName: contact?.name || (contact as any)?.verifiedName || remoteJid.split('@')[0],
+      pushName: this.pickPreferredName(
+        (contact as any)?.verifiedName,
+        contact?.name,
+        (contact as any)?.notify,
+        remoteJid.split('@')[0],
+      ),
       profilePicUrl: null,
       instanceId: this.instanceId,
     };
   }
 
-  private normalizeChatPayload(
+  private async normalizeChatPayload(
     chat: Partial<Chat> & { id?: string; phoneNumber?: string | null; unreadCount?: number; name?: string },
   ) {
-    const resolution = this.resolveCanonicalJid(chat.id, (chat as any)?.remoteJidAlt, {
+    const resolution = await this.resolveCanonicalJidWithNative(chat.id, (chat as any)?.remoteJidAlt, {
       phoneNumber: chat.phoneNumber,
-      remoteLid: (chat as any)?.remoteLid,
+      remoteLid: (chat as any)?.remoteLid ?? (chat as any)?.accountLid,
     });
     const remoteJid = resolution.remoteJid;
 
@@ -459,18 +639,245 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  private chatPersistencePayload(chat: {
+    remoteJid: string;
+    instanceId: string;
+    name?: string | null;
+    unreadMessages: number;
+    labels?: Prisma.JsonValue | Prisma.InputJsonValue | null;
+  }) {
+    const name = this.pickPreferredName(chat.name);
+
+    return {
+      remoteJid: chat.remoteJid,
+      instanceId: chat.instanceId,
+      unreadMessages: chat.unreadMessages,
+      ...(name ? { name } : {}),
+      ...(chat.labels !== undefined ? { labels: chat.labels as Prisma.InputJsonValue | null } : {}),
+    };
+  }
+
   private contactPersistencePayload(contact: {
     remoteJid: string;
     pushName?: string;
     profilePicUrl?: string | null;
     instanceId: string;
   }) {
+    const pushName = this.pickPreferredName(contact.pushName);
+    const profilePicUrl = this.trimToUndefined(contact.profilePicUrl);
+
     return {
       remoteJid: contact.remoteJid,
-      pushName: contact.pushName,
-      profilePicUrl: contact.profilePicUrl,
       instanceId: contact.instanceId,
+      ...(pushName ? { pushName } : {}),
+      ...(profilePicUrl ? { profilePicUrl } : {}),
     };
+  }
+
+  private async reconcileMessageIdentityAliases(resolution: Partial<CanonicalJidResolution> = {}) {
+    const remoteJid = this.normalizeJid(resolution.remoteJid);
+
+    if (!remoteJid) {
+      return 0;
+    }
+
+    const aliasJids = this.buildIdentityCandidates(resolution).filter((candidate) => candidate !== remoteJid);
+    if (!aliasJids.length) {
+      return 0;
+    }
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let updatedMessages = 0;
+
+    if (provider === 'mysql') {
+      updatedMessages = await this.prismaRepository.$executeRaw(
+        Prisma.sql`
+          UPDATE Message
+          SET \`key\` = JSON_SET(\`key\`, '$.remoteJid', ${remoteJid})
+          WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) IN (${Prisma.join(aliasJids)})
+        `,
+      );
+    } else {
+      updatedMessages = await this.prismaRepository.$executeRaw(
+        Prisma.sql`
+          UPDATE "Message"
+          SET "key" = jsonb_set("key", '{remoteJid}', to_jsonb(CAST(${remoteJid} AS text)), true)
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'remoteJid' IN (${Prisma.join(aliasJids)})
+        `,
+      );
+    }
+
+    await this.prismaRepository.messageUpdate.updateMany({
+      where: { instanceId: this.instanceId, remoteJid: { in: aliasJids } },
+      data: { remoteJid },
+    });
+
+    return Number(updatedMessages) || 0;
+  }
+
+  private async persistCanonicalContactEntity(
+    resolution: Partial<CanonicalJidResolution> & { pushName?: string | null; profilePicUrl?: string | null } = {},
+  ) {
+    const remoteJid = this.normalizeJid(resolution.remoteJid);
+
+    if (!remoteJid) {
+      return null;
+    }
+
+    const candidates = this.buildIdentityCandidates(resolution);
+    const contacts = candidates.length
+      ? await this.prismaRepository.contact.findMany({
+          where: { instanceId: this.instanceId, remoteJid: { in: candidates } },
+        })
+      : [];
+
+    const pushName = this.pickPreferredName(resolution.pushName, ...contacts.map((contact) => contact.pushName));
+    const profilePicUrl = this.pickPreferredName(
+      resolution.profilePicUrl,
+      ...contacts.map((contact) => contact.profilePicUrl),
+    );
+    const hasIncomingData = !!this.pickPreferredName(resolution.pushName, resolution.profilePicUrl);
+
+    if (!contacts.length && !hasIncomingData) {
+      return null;
+    }
+
+    const aliasContactIds = contacts.filter((contact) => contact.remoteJid !== remoteJid).map((contact) => contact.id);
+    const payload = this.contactPersistencePayload({
+      remoteJid,
+      pushName,
+      profilePicUrl,
+      instanceId: this.instanceId,
+    });
+
+    await this.prismaRepository.$transaction([
+      this.prismaRepository.contact.upsert({
+        where: { remoteJid_instanceId: { remoteJid, instanceId: this.instanceId } },
+        create: payload,
+        update: payload,
+      }),
+      ...(aliasContactIds.length
+        ? [
+            this.prismaRepository.contact.deleteMany({
+              where: { id: { in: aliasContactIds } },
+            }),
+          ]
+        : []),
+    ]);
+
+    return {
+      remoteJid,
+      pushName,
+      profilePicUrl,
+      instanceId: this.instanceId,
+    };
+  }
+
+  private async persistCanonicalChatEntity(
+    resolution: Partial<CanonicalJidResolution> & {
+      name?: string | null;
+      unreadMessages?: number;
+      labels?: Prisma.JsonValue | Prisma.InputJsonValue | null;
+    } = {},
+  ) {
+    const remoteJid = this.normalizeJid(resolution.remoteJid);
+
+    if (!remoteJid) {
+      return null;
+    }
+
+    const candidates = this.buildIdentityCandidates(resolution);
+    const chats = candidates.length
+      ? await this.prismaRepository.chat.findMany({
+          where: { instanceId: this.instanceId, remoteJid: { in: candidates } },
+        })
+      : [];
+
+    const canonicalChat = chats.find((chat) => chat.remoteJid === remoteJid);
+    const incomingName = this.pickPreferredName(resolution.name);
+    const mergedName = this.pickPreferredName(incomingName, ...chats.map((chat) => chat.name));
+    const mergedLabels =
+      resolution.labels !== undefined
+        ? resolution.labels
+        : (canonicalChat?.labels ?? chats.find((chat) => chat.labels != null)?.labels);
+    const mergedUnreadMessages =
+      resolution.unreadMessages !== undefined
+        ? resolution.unreadMessages
+        : (canonicalChat?.unreadMessages ?? Math.max(...chats.map((chat) => chat.unreadMessages), 0));
+    const hasIncomingData =
+      incomingName !== undefined || resolution.unreadMessages !== undefined || resolution.labels !== undefined;
+
+    if (!chats.length && !hasIncomingData) {
+      return null;
+    }
+
+    const aliasChatIds = chats.filter((chat) => chat.remoteJid !== remoteJid).map((chat) => chat.id);
+    const payload = this.chatPersistencePayload({
+      remoteJid,
+      instanceId: this.instanceId,
+      name: mergedName,
+      unreadMessages: mergedUnreadMessages,
+      labels: mergedLabels,
+    });
+
+    await this.prismaRepository.$transaction([
+      this.prismaRepository.chat.upsert({
+        where: { instanceId_remoteJid: { instanceId: this.instanceId, remoteJid } },
+        create: payload,
+        update: payload,
+      }),
+      ...(aliasChatIds.length
+        ? [
+            this.prismaRepository.chat.deleteMany({
+              where: { id: { in: aliasChatIds } },
+            }),
+          ]
+        : []),
+    ]);
+
+    return payload;
+  }
+
+  private async reconcileIdentityAliases(
+    resolution: Partial<CanonicalJidResolution> = {},
+    options: {
+      contact?: { pushName?: string | null; profilePicUrl?: string | null };
+      chat?: {
+        name?: string | null;
+        unreadMessages?: number;
+        labels?: Prisma.JsonValue | Prisma.InputJsonValue | null;
+      };
+      syncMessages?: boolean;
+    } = {},
+  ) {
+    const remoteJid = this.normalizeJid(resolution.remoteJid);
+
+    if (!remoteJid) {
+      return;
+    }
+
+    const updatedMessages = options.syncMessages === false ? 0 : await this.reconcileMessageIdentityAliases(resolution);
+
+    await Promise.all([
+      this.persistCanonicalContactEntity({ ...resolution, ...(options.contact ?? {}) }),
+      this.persistCanonicalChatEntity({ ...resolution, ...(options.chat ?? {}) }),
+    ]);
+
+    const cachePayload = this.cachePayloadForJid({
+      remoteJid,
+      remoteJidAlt: this.normalizeJid(resolution.remoteJidAlt),
+      remoteLid: this.normalizeJid(resolution.remoteLid),
+    } as CanonicalJidResolution);
+
+    if (cachePayload && (cachePayload.remoteJid.includes('@s.whatsapp') || cachePayload.remoteJid.includes('@lid'))) {
+      await saveOnWhatsappCache([cachePayload]);
+    }
+
+    if (updatedMessages > 0 && options.chat?.unreadMessages === undefined) {
+      await this.updateChatUnreadMessages(remoteJid);
+    }
   }
 
   private cachePayloadForJid(resolution: CanonicalJidResolution) {
@@ -1173,23 +1580,23 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       const existingChatIdSet = new Set(existingChatIds.map((chat) => chat.remoteJid));
-      const normalizedChats = chats.map((chat) => this.normalizeChatPayload(chat)).filter(Boolean);
+      const normalizedChats = (
+        await mapWithConcurrencyLimit(chats, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (chat) =>
+          this.normalizeChatPayload(chat),
+        )
+      ).filter(Boolean);
 
       const chatsToInsert = normalizedChats.filter((chat) => !existingChatIdSet?.has(chat.remoteJid));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
 
-      if (chatsToInsert.length > 0) {
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
-          await this.prismaRepository.chat.createMany({
-            data: chatsToInsert.map((chat) => ({
-              remoteJid: chat.remoteJid,
-              instanceId: this.instanceId,
-              name: chat.name,
-              unreadMessages: chat.unreadMessages,
-            })),
-            skipDuplicates: true,
+      if (normalizedChats.length > 0 && this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+        await eachWithConcurrencyLimit(normalizedChats, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (chat) => {
+          await this.reconcileIdentityAliases(chat, {
+            chat: { name: chat.name, unreadMessages: chat.unreadMessages },
+            syncMessages: false,
           });
+        });
       }
     },
 
@@ -1200,37 +1607,30 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
-      const chatsRaw = chats.map((chat) => this.normalizeChatPayload(chat as any)).filter(Boolean);
+      const chatsRaw = (
+        await mapWithConcurrencyLimit(chats, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (chat) =>
+          this.normalizeChatPayload(chat as any),
+        )
+      ).filter(Boolean);
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
-      for (const chat of chats) {
-        const normalizedChat = this.normalizeChatPayload(chat as any);
-        if (!normalizedChat) {
-          continue;
-        }
-
-        const remoteJidCandidates = [
-          normalizedChat.remoteJid,
-          normalizedChat.rawRemoteJid,
-          normalizedChat.remoteJidAlt,
-          normalizedChat.remoteLid,
-        ].filter((jid, index, array) => !!jid && array.indexOf(jid) === index);
-
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: { in: remoteJidCandidates } },
-          data: {
-            remoteJid: normalizedChat.remoteJid,
-            ...(normalizedChat.name ? { name: normalizedChat.name } : {}),
-            unreadMessages: normalizedChat.unreadMessages,
-          },
+      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+        await eachWithConcurrencyLimit(chatsRaw, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (chat) => {
+          await this.reconcileIdentityAliases(chat, {
+            chat: { name: chat.name, unreadMessages: chat.unreadMessages },
+            syncMessages: false,
+          });
         });
       }
     },
 
     'chats.delete': async (chats: string[]) => {
-      chats.forEach(async (chat) => {
-        const resolution = this.resolveCanonicalJid(chat);
+      const resolutions = await mapWithConcurrencyLimit(chats, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (chat) =>
+        this.resolveCanonicalJidWithNative(chat),
+      );
+
+      await eachWithConcurrencyLimit(resolutions, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (resolution) => {
         const remoteJidCandidates = [
           resolution.remoteJid,
           resolution.rawRemoteJid,
@@ -1245,7 +1645,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.sendDataWebhook(
         Events.CHATS_DELETE,
-        chats.map((chat) => this.resolveCanonicalJid(chat).remoteJid || chat),
+        resolutions.map((resolution, index) => resolution.remoteJid || chats[index]),
       );
     },
   };
@@ -1253,7 +1653,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
-        const contactsRaw: any[] = contacts.map((contact) => this.normalizeContactPayload(contact)).filter(Boolean);
+        const contactsRaw = (
+          await mapWithConcurrencyLimit(contacts, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (contact) =>
+            this.normalizeContactPayload(contact),
+          )
+        ).filter(Boolean);
 
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
@@ -1264,8 +1668,10 @@ export class BaileysStartupService extends ChannelStartupService {
               skipDuplicates: true,
             });
 
-          const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
+          const usersContacts = contactsRaw.filter(
+            (c) => c.remoteJid.includes('@s.whatsapp') || c.remoteJid.includes('@lid'),
+          );
+          if (usersContacts.length > 0) {
             await saveOnWhatsappCache(
               usersContacts
                 .map((contact) =>
@@ -1288,7 +1694,7 @@ export class BaileysStartupService extends ChannelStartupService {
         ) {
           this.chatwootService.addHistoryContacts(
             { instanceName: this.instance.name, instanceId: this.instance.id },
-            contactsRaw,
+            contactsRaw as unknown as ContactModel[],
           );
           chatwootImport.importHistoryContacts(
             { instanceName: this.instance.name, instanceId: this.instance.id },
@@ -1298,23 +1704,23 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const updatedContacts = (
           await mapWithConcurrencyLimit(contacts, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (contact) => {
-            const normalizedContact = this.normalizeContactPayload(contact);
+            const normalizedContact = await this.normalizeContactPayload(contact);
             if (!normalizedContact) {
               return null;
             }
 
-            const profilePicJid = normalizedContact.remoteJid || normalizedContact.rawRemoteJid;
-
             return {
               ...normalizedContact,
-              profilePicUrl: profilePicJid ? (await this.profilePicture(profilePicJid)).profilePictureUrl : null,
+              profilePicUrl: await this.resolveProfilePictureUrlForIdentity(normalizedContact),
             };
           })
         ).filter(Boolean);
 
         if (updatedContacts.length > 0) {
-          const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
+          const usersContacts = updatedContacts.filter(
+            (c) => c.remoteJid.includes('@s.whatsapp') || c.remoteJid.includes('@lid'),
+          );
+          if (usersContacts.length > 0) {
             await saveOnWhatsappCache(
               usersContacts
                 .map((contact) =>
@@ -1331,24 +1737,19 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
           await eachWithConcurrencyLimit(updatedContacts, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (contact) => {
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-              await this.prismaRepository.contact.updateMany({
-                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                data: this.contactPersistencePayload(contact),
+              await this.reconcileIdentityAliases(contact, {
+                contact: { pushName: contact.pushName, profilePicUrl: contact.profilePicUrl },
               });
             }
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
-
-              const findParticipant = await this.chatwootService.findContact(instance, contact.remoteJid.split('@')[0]);
-
-              if (!findParticipant) {
-                return;
-              }
-
-              await this.chatwootService.updateContact(instance, findParticipant.id, {
-                name: contact.pushName,
-                avatar_url: contact.profilePicUrl,
+              await this.chatwootService.reconcileContactIdentity(instance, {
+                remoteJid: contact.remoteJid,
+                remoteJidAlt: contact.remoteJidAlt,
+                remoteLid: contact.remoteLid,
+                pushName: contact.pushName,
+                profilePicUrl: contact.profilePicUrl,
               });
             }
           });
@@ -1363,30 +1764,56 @@ export class BaileysStartupService extends ChannelStartupService {
       const contactsRaw: any[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
-        const normalizedContact = this.normalizeContactPayload(contact as Contact);
+        const normalizedContact = await this.normalizeContactPayload(contact as Contact);
         if (!normalizedContact) {
           continue;
         }
 
-        const profilePicJid = normalizedContact.remoteJid || normalizedContact.rawRemoteJid;
-
         contactsRaw.push({
           ...normalizedContact,
-          profilePicUrl: profilePicJid ? (await this.profilePicture(profilePicJid)).profilePictureUrl : null,
+          profilePicUrl: await this.resolveProfilePictureUrlForIdentity(normalizedContact),
         });
+      }
+
+      const usersContacts = contactsRaw.filter(
+        (c) => c.remoteJid.includes('@s.whatsapp') || c.remoteJid.includes('@lid'),
+      );
+      if (usersContacts.length > 0) {
+        await saveOnWhatsappCache(
+          usersContacts
+            .map((contact) =>
+              this.cachePayloadForJid({
+                remoteJid: contact.remoteJid,
+                remoteJidAlt: contact.remoteJidAlt,
+                remoteLid: contact.remoteLid,
+              }),
+            )
+            .filter(Boolean) as any,
+        );
       }
 
       this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
 
-      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-        await eachWithConcurrencyLimit(contactsRaw, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (contact) => {
-          await this.prismaRepository.contact.upsert({
-            where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: this.contactPersistencePayload(contact),
-            update: this.contactPersistencePayload(contact),
+      await eachWithConcurrencyLimit(contactsRaw, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (contact) => {
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+          await this.reconcileIdentityAliases(contact, {
+            contact: { pushName: contact.pushName, profilePicUrl: contact.profilePicUrl },
           });
-        });
-      }
+        }
+
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+          await this.chatwootService.reconcileContactIdentity(
+            { instanceName: this.instance.name, instanceId: this.instance.id },
+            {
+              remoteJid: contact.remoteJid,
+              remoteJidAlt: contact.remoteJidAlt,
+              remoteLid: contact.remoteLid,
+              pushName: contact.pushName,
+              profilePicUrl: contact.profilePicUrl,
+            },
+          );
+        }
+      });
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
@@ -1466,49 +1893,32 @@ export class BaileysStartupService extends ChannelStartupService {
           contactsMapLidJid.set(contact.id, { jid });
         }
 
-        const chatsRaw: { remoteJid: string; remoteLid: string; instanceId: string; name?: string }[] = [];
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
             (chat) => chat.remoteJid,
           ),
         );
-
-        for (const chat of chats) {
-          if (chatsRepository?.has(chat.id)) {
-            continue;
-          }
-
-          let remoteJid = null;
-          let remoteLid = null;
-
-          if (chat.id.search('@lid') !== -1) {
-            const contact = contactsMapLidJid.get(chat.id);
-
-            remoteLid = chat.id;
-
-            if (contact && contact.jid) {
-              remoteJid = contact.jid;
-            }
-          }
-
-          if (!remoteLid && chat.accountLid && chat.accountLid.search('@lid') !== -1) {
-            remoteLid = chat.accountLid;
-          }
-
-          if (!remoteJid) {
-            remoteJid = chat.id;
-          }
-
-          chatsRaw.push({ remoteJid, remoteLid, instanceId: this.instanceId, name: chat.name });
-        }
+        const normalizedHistoryChats = (
+          await mapWithConcurrencyLimit(chats, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (chat) =>
+            this.normalizeChatPayload({
+              ...chat,
+              id: chat.id,
+              name: chat.name,
+              unreadCount: (chat as any).unreadCount,
+              phoneNumber: contactsMapLidJid.get(chat.id)?.jid,
+              remoteLid: chat.accountLid,
+            } as any),
+          )
+        ).filter(Boolean);
+        const chatsRaw = normalizedHistoryChats.filter((chat) => !chatsRepository.has(chat.remoteJid));
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          const chatsToCreateMany = JSON.parse(JSON.stringify(chatsRaw)).map((chat) => {
-            delete chat.remoteLid;
-            return chat;
+          await eachWithConcurrencyLimit(chatsRaw, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (chat) => {
+            await this.reconcileIdentityAliases(chat, {
+              chat: { name: chat.name, unreadMessages: chat.unreadMessages },
+              syncMessages: false,
+            });
           });
-
-          await this.prismaRepository.chat.createMany({ data: chatsToCreateMany, skipDuplicates: true });
         }
 
         this.historySyncChatCount += chatsRaw.length;
@@ -1582,7 +1992,12 @@ export class BaileysStartupService extends ChannelStartupService {
             keyAny.addressingMode = historicalIdentity.addressingMode;
           }
 
-          messagesRaw.push(this.prepareMessage(m));
+          messagesRaw.push(
+            await this.prepareMessageWithNative(m, {
+              phoneNumber: contactsMapLidJid.get(keyAny.remoteJid)?.jid,
+              remoteLid: keyAny.remoteLid,
+            }),
+          );
         }
 
         this.historySyncMessageCount += messagesRaw.length;
@@ -1736,8 +2151,12 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          const messageRaw = this.prepareMessage(received) as any;
+          const messageRaw = (await this.prepareMessageWithNative(received)) as any;
           const canonicalRemoteJid = (messageRaw.key as any).remoteJid;
+          const chatDisplayName =
+            received.key.fromMe || canonicalRemoteJid.includes('@g.us')
+              ? undefined
+              : this.pickPreferredName(received.pushName);
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: canonicalRemoteJid },
@@ -1746,25 +2165,21 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (
             existingChat &&
-            received.pushName &&
-            existingChat.name !== received.pushName &&
-            received.pushName.trim().length > 0 &&
+            chatDisplayName &&
+            existingChat.name !== chatDisplayName &&
             !received.key.fromMe &&
             !canonicalRemoteJid.includes('@g.us')
           ) {
             this.sendDataWebhook(Events.CHATS_UPSERT, [
-              { ...existingChat, remoteJid: canonicalRemoteJid, name: received.pushName },
+              { ...existingChat, remoteJid: canonicalRemoteJid, name: chatDisplayName },
             ]);
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
-              try {
-                await this.prismaRepository.chat.update({
-                  where: { id: existingChat.id },
-                  data: { name: received.pushName, remoteJid: canonicalRemoteJid },
-                });
-              } catch {
-                console.log(`Chat insert record ignored: ${canonicalRemoteJid} - ${this.instanceId}`);
-              }
-            }
+          }
+
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+            await this.reconcileIdentityAliases(messageRaw.key as any, {
+              chat: { name: chatDisplayName, unreadMessages: 0 },
+              syncMessages: false,
+            });
           }
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
@@ -2052,19 +2467,20 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
-          const contactIdentity = this.resolveCanonicalJid(received.key.remoteJid, (received.key as any).remoteJidAlt, {
-            remoteLid: (received.key as any).remoteLid,
-          });
+          const contactIdentity = await this.resolveCanonicalJidWithNative(
+            received.key.remoteJid,
+            (received.key as any).remoteJidAlt,
+            {
+              remoteLid: (received.key as any).remoteLid,
+            },
+          );
+          const contactCandidates = this.buildIdentityCandidates(contactIdentity, received.key.remoteJid);
           const contactRemoteJid = contactIdentity.remoteJid;
           if (!contactRemoteJid || contactRemoteJid === 'status@broadcast') {
             continue;
           }
-          const profilePicLookupJid = contactRemoteJid || contactIdentity.rawRemoteJid;
 
-          const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: contactRemoteJid, instanceId: this.instanceId },
-          });
-
+          const contact = await this.findBestContactByJids(contactCandidates);
           const contactRaw: any = {
             remoteJid: contactRemoteJid,
             canonicalJid: contactRemoteJid,
@@ -2074,10 +2490,13 @@ export class BaileysStartupService extends ChannelStartupService {
                 : undefined,
             remoteJidAlt: contactIdentity.remoteJidAlt,
             remoteLid: contactIdentity.remoteLid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: profilePicLookupJid
-              ? (await this.profilePicture(profilePicLookupJid)).profilePictureUrl
-              : null,
+            pushName: received.key.fromMe
+              ? undefined
+              : this.pickPreferredName(received.pushName, contact?.pushName, contactRemoteJid.split('@')[0]),
+            profilePicUrl:
+              (await this.resolveProfilePictureUrlForIdentity(contactIdentity, received.key.remoteJid)) ??
+              contact?.profilePicUrl ??
+              undefined,
             instanceId: this.instanceId,
           };
 
@@ -2099,24 +2518,24 @@ export class BaileysStartupService extends ChannelStartupService {
               );
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: this.contactPersistencePayload(contactRaw),
-                update: this.contactPersistencePayload(contactRaw),
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              await this.reconcileIdentityAliases(contactRaw, {
+                contact: { pushName: contactRaw.pushName, profilePicUrl: contactRaw.profilePicUrl },
+                chat: { name: chatDisplayName, unreadMessages: 0 },
               });
+            }
 
             continue;
           }
 
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: this.contactPersistencePayload(contactRaw),
-              create: this.contactPersistencePayload(contactRaw),
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            await this.reconcileIdentityAliases(contactRaw, {
+              contact: { pushName: contactRaw.pushName, profilePicUrl: contactRaw.profilePicUrl },
+              chat: { name: chatDisplayName, unreadMessages: 0 },
             });
+          }
         }
       } catch (error) {
         this.logger.error(error);
@@ -2130,7 +2549,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       for await (const { key, update } of args) {
         const keyAny = key as any;
-        this.applyCanonicalKeyIdentity(keyAny);
+        await this.applyCanonicalKeyIdentityWithNative(keyAny);
 
         const normalizedRemoteJid = keyAny.remoteJid;
         const normalizedParticipant = keyAny.participant;
@@ -2312,16 +2731,23 @@ export class BaileysStartupService extends ChannelStartupService {
           });
 
           if (existingChat) {
-            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
+            this.sendDataWebhook(Events.CHATS_UPSERT, [
+              { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 },
+            ]);
+          }
 
-            this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
-              try {
-                await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
-              } catch {
-                console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
-              }
-            }
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+            await this.reconcileIdentityAliases(
+              {
+                remoteJid: message.remoteJid,
+                remoteJidAlt: keyAny.remoteJidAlt,
+                remoteLid: keyAny.remoteLid,
+              },
+              {
+                chat: { unreadMessages: 0 },
+                syncMessages: false,
+              },
+            );
           }
         }
       }
@@ -3074,7 +3500,7 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
       }
 
-      const messageRaw = this.prepareMessage(messageSent) as any;
+      const messageRaw = (await this.prepareMessageWithNative(messageSent)) as any;
 
       const isMedia =
         messageSent?.message?.imageMessage ||
@@ -4312,23 +4738,65 @@ export class BaileysStartupService extends ChannelStartupService {
     onWhatsapp.push(...groups);
 
     // USERS
-    const contacts: any[] = await this.prismaRepository.contact.findMany({
-      where: { instanceId: this.instanceId, remoteJid: { in: jids.users.map(({ jid }) => jid) } },
+    const userContexts = await mapWithConcurrencyLimit(jids.users, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async (user) => {
+      const normalizedInputJid = this.normalizeJid(user.jid) ?? user.jid;
+      const nativePnJid = await this.resolveLidToPnJid(normalizedInputJid);
+      const identity = await this.resolveCanonicalJidWithNative(
+        nativePnJid ?? normalizedInputJid,
+        nativePnJid && nativePnJid !== normalizedInputJid ? normalizedInputJid : undefined,
+        {
+          remoteLid: this.isLidJid(normalizedInputJid) ? normalizedInputJid : undefined,
+        },
+      );
+
+      return {
+        ...user,
+        jid: normalizedInputJid,
+        nativePnJid,
+        identity,
+        candidates: this.buildIdentityCandidates(identity, normalizedInputJid, nativePnJid),
+      };
     });
 
-    // Unified cache verification for all numbers (normal and LID)
-    const numbersToVerify = jids.users.map(({ jid }) => jid.replace('+', ''));
+    const allIdentityCandidates = [...new Set(userContexts.flatMap((user) => user.candidates))];
+    const contacts = allIdentityCandidates.length
+      ? await this.prismaRepository.contact.findMany({
+          where: { instanceId: this.instanceId, remoteJid: { in: allIdentityCandidates } },
+        })
+      : [];
 
-    // Get all numbers from cache
-    const cachedNumbers = await getOnWhatsappCache(numbersToVerify);
+    const contactByJid = new Map<string, (typeof contacts)[number]>(
+      contacts.map((contact) => [contact.remoteJid, contact] as const),
+    );
 
-    // Separate numbers that are and are not in cache
-    const cachedJids = new Set(cachedNumbers.flatMap((cached) => cached.jidOptions));
-    const numbersNotInCache = numbersToVerify.filter((jid) => !cachedJids.has(jid));
+    const cachedNumbers = await getOnWhatsappCache(allIdentityCandidates);
 
-    // Only call Baileys for normal numbers (@s.whatsapp.net) that are not in cache
+    const findCachedIdentity = (candidates: string[]) =>
+      cachedNumbers.find((cached) =>
+        candidates.some((candidate) => cached.remoteJid === candidate || cached.jidOptions.includes(candidate)),
+      );
+
+    const pickContactName = (candidates: string[]) => {
+      for (const candidate of candidates) {
+        const name = this.pickPreferredName(contactByJid.get(candidate)?.pushName);
+        if (name) {
+          return name;
+        }
+      }
+
+      return undefined;
+    };
+
+    const usersNeedingVerification = userContexts.filter((user) => {
+      if (user.nativePnJid || user.jid.includes('@lid')) {
+        return false;
+      }
+
+      return !findCachedIdentity(user.candidates);
+    });
+
     let verify: { jid: string; exists: boolean }[] = [];
-    const normalNumbersNotInCache = numbersNotInCache.filter((jid) => !jid.includes('@lid'));
+    const normalNumbersNotInCache = usersNeedingVerification.map((user) => user.jid);
 
     if (normalNumbersNotInCache.length > 0) {
       this.logger.verbose(`Checking ${normalNumbersNotInCache.length} numbers via Baileys (not found in cache)`);
@@ -4336,36 +4804,44 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const verifiedUsers = await Promise.all(
-      jids.users.map(async (user) => {
-        // Try to get from cache first (works for all: normal and LID)
-        const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
-
+      userContexts.map(async (user) => {
+        const cached = findCachedIdentity(user.candidates);
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
           return new OnWhatsAppDto(
             cached.remoteJid,
             true,
             user.number,
-            contacts.find((c) => c.remoteJid === cached.remoteJid)?.pushName,
-            cached.lid || (cached.remoteJid.includes('@lid') ? 'lid' : undefined),
+            pickContactName(this.uniqueNormalizedJids(...user.candidates, cached.remoteJid)),
+            cached.lid || user.candidates.some((candidate) => candidate.includes('@lid')) ? 'lid' : undefined,
           );
         }
 
-        // If it's a LID number and not in cache, consider it valid
-        if (user.jid.includes('@lid')) {
+        if (user.nativePnJid) {
           return new OnWhatsAppDto(
-            user.jid,
+            user.nativePnJid,
             true,
             user.number,
-            contacts.find((c) => c.remoteJid === user.jid)?.pushName,
+            pickContactName(this.uniqueNormalizedJids(...user.candidates, user.nativePnJid)),
             'lid',
           );
         }
 
-        // If not in cache and is a normal number, use Baileys verification
+        if (user.jid.includes('@lid')) {
+          const localContact = await this.findBestContactByJids(user.candidates);
+          const resolvedJid = localContact?.remoteJid ?? user.identity.remoteJid ?? user.jid;
+
+          return new OnWhatsAppDto(
+            resolvedJid,
+            !!localContact,
+            user.number,
+            this.pickPreferredName(localContact?.pushName),
+            'lid',
+          );
+        }
+
         let numberVerified: (typeof verify)[0] | null = null;
 
-        // Brazilian numbers
         if (user.number.startsWith('55')) {
           const numberWithDigit =
             user.number.slice(4, 5) === '9' && user.number.length === 13
@@ -4379,8 +4855,6 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        // Mexican/Argentina numbers
-        // Ref: https://faq.whatsapp.com/1294841057948784
         if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
           let prefix = '';
           if (user.number.startsWith('52')) {
@@ -4406,37 +4880,39 @@ export class BaileysStartupService extends ChannelStartupService {
           numberVerified = verify.find((v) => v.jid === user.jid);
         }
 
-        const numberJid = numberVerified?.jid || user.jid;
+        const numberJid = numberVerified?.jid || user.identity.remoteJid || user.jid;
 
         return new OnWhatsAppDto(
           numberJid,
           !!numberVerified?.exists,
           user.number,
-          contacts.find((c) => c.remoteJid === numberJid)?.pushName,
+          pickContactName(this.uniqueNormalizedJids(...user.candidates, numberJid)),
           undefined,
         );
       }),
     );
 
-    // Combine results
     onWhatsapp.push(...verifiedUsers);
 
-    // TODO: Salvar no cache apenas números que NÃO estavam no cache
-    const numbersToCache = onWhatsapp.filter((user) => {
-      if (!user.exists) return false;
-      // Verifica se estava no cache usando jidOptions
-      const cached = cachedNumbers?.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
-      return !cached;
-    });
+    const numbersToCache = userContexts
+      .map((user, index) => ({ user, result: verifiedUsers[index] }))
+      .filter(({ user, result }) => result.exists && !findCachedIdentity(user.candidates))
+      .map(({ user, result }) => ({
+        remoteJid: result.jid,
+        remoteJidAlt:
+          user.jid.includes('@lid') && result.jid !== user.jid ? user.jid : (user.identity.remoteJidAlt ?? undefined),
+        lid:
+          user.jid.includes('@lid') ||
+          user.identity.remoteLid ||
+          user.identity.remoteJidAlt?.includes?.('@lid') ||
+          result.jid.includes('@lid')
+            ? ('lid' as const)
+            : undefined,
+      }));
 
     if (numbersToCache.length > 0) {
       this.logger.verbose(`Salvando ${numbersToCache.length} números no cache`);
-      await saveOnWhatsappCache(
-        numbersToCache.map((user) => ({
-          remoteJid: user.jid,
-          lid: user.lid === 'lid' ? 'lid' : undefined,
-        })),
-      );
+      await saveOnWhatsappCache(numbersToCache);
     }
 
     return onWhatsapp;
@@ -5375,21 +5851,71 @@ export class BaileysStartupService extends ChannelStartupService {
   public async findParticipants(id: GroupJid) {
     try {
       const participants = (await this.client.groupMetadata(id.groupJid)).participants;
-      const contacts = await this.prismaRepository.contact.findMany({
-        where: { instanceId: this.instanceId, remoteJid: { in: participants.map((p) => p.id) } },
-      });
-      const parsedParticipants = participants.map((participant) => {
-        const contact = contacts.find((c) => c.remoteJid === participant.id);
+
+      const participantContexts = await mapWithConcurrencyLimit(
+        participants as any[],
+        CONTACT_PROFILE_LOOKUP_CONCURRENCY,
+        async (participant: any) => {
+          const resolution = await this.resolveCanonicalJidWithNative(participant.id, participant.lid, {
+            phoneNumber: participant.phoneNumber,
+            remoteLid: this.isLidJid(participant.id) ? participant.id : participant.lid,
+          });
+
+          return {
+            participant,
+            resolution,
+            candidates: this.buildIdentityCandidates(
+              resolution,
+              participant.id,
+              participant.phoneNumber ? createJid(participant.phoneNumber) : undefined,
+              participant.lid,
+            ),
+          };
+        },
+      );
+
+      const contactCandidates = [...new Set(participantContexts.flatMap((participant) => participant.candidates))];
+      const contacts = contactCandidates.length
+        ? await this.prismaRepository.contact.findMany({
+            where: { instanceId: this.instanceId, remoteJid: { in: contactCandidates } },
+          })
+        : [];
+
+      const contactByJid = new Map<string, (typeof contacts)[number]>(
+        contacts.map((contact) => [contact.remoteJid, contact] as const),
+      );
+
+      const parsedParticipants = participantContexts.map(({ participant, resolution, candidates }) => {
+        const contact =
+          candidates.map((candidate) => contactByJid.get(candidate)).find((candidate) => !!candidate) ?? null;
+
         return {
           ...participant,
-          name: participant.name ?? contact?.pushName,
+          canonicalJid: resolution.remoteJid,
+          phoneNumber:
+            participant.phoneNumber ??
+            (!resolution.remoteJid || this.isLidJid(resolution.remoteJid)
+              ? undefined
+              : resolution.remoteJid.split('@')[0]),
+          lid: participant.lid ?? resolution.remoteLid,
+          name: this.pickPreferredName(participant.name, contact?.pushName),
           imgUrl: participant.imgUrl ?? contact?.profilePicUrl,
         };
       });
 
-      const usersContacts = parsedParticipants.filter((c) => c.id.includes('@s.whatsapp'));
-      if (usersContacts) {
-        await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.id })));
+      const usersContacts = parsedParticipants
+        .filter((participant) => participant.canonicalJid || participant.id)
+        .map((participant) => ({
+          remoteJid: participant.canonicalJid ?? participant.id,
+          remoteJidAlt:
+            participant.lid && participant.canonicalJid && participant.canonicalJid !== participant.lid
+              ? participant.lid
+              : undefined,
+          lid: participant.lid ? ('lid' as const) : undefined,
+        }));
+
+      if (usersContacts.length > 0) {
+        await saveOnWhatsappCache(usersContacts);
       }
 
       return { participants: parsedParticipants };
@@ -5547,6 +6073,15 @@ export class BaileysStartupService extends ChannelStartupService {
     return messageRaw;
   }
 
+  private async prepareMessageWithNative(
+    message: WAMessage,
+    options: { phoneNumber?: string | null; remoteLid?: string | null } = {},
+  ): Promise<Message> {
+    const keyAny = message.key as any;
+    await this.applyCanonicalKeyIdentityWithNative(keyAny, options);
+    return this.prepareMessage(message);
+  }
+
   private async syncChatwootLostMessages() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       const chatwootConfig = await this.findChatwoot();
@@ -5642,7 +6177,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
+      this.prismaRepository.chat.findFirst({ where: { instanceId: this.instanceId, remoteJid } }),
       unreadMessagesPromise,
     ]);
 

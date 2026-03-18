@@ -48,10 +48,16 @@ async function bootstrap() {
     cors({
       origin(requestOrigin, callback) {
         const { ORIGIN } = configService.get<Cors>('CORS');
-        if (ORIGIN.includes('*')) {
+        const allowedOrigins = ORIGIN.map((origin) => origin?.trim()).filter(Boolean);
+
+        // Server-to-server calls omit Origin; allow them explicitly.
+        if (!requestOrigin) {
           return callback(null, true);
         }
-        if (ORIGIN.indexOf(requestOrigin) !== -1) {
+        if (allowedOrigins.includes('*')) {
+          return callback(null, true);
+        }
+        if (allowedOrigins.includes(requestOrigin)) {
           return callback(null, true);
         }
         return callback(new Error('Not allowed by CORS'));

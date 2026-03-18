@@ -113,13 +113,14 @@ class ChatwootImport {
 
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
+          const isLid = contact.remoteJid.includes('@lid');
 
           const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
           let bindPhoneNumber: string;
-          if (!isGroup) {
+          if (!isGroup && !isLid) {
             bindInsert.push(`+${contact.remoteJid.split('@')[0]}`);
             bindPhoneNumber = `$${bindInsert.length}`;
           } else {
