@@ -311,7 +311,6 @@ export class BaileysStartupService extends ChannelStartupService {
   private connectInFlight: Promise<WASocket> | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
-
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
   private historySyncChatCount = 0;
@@ -370,6 +369,200 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private uniqueNormalizedJids(...jids: Array<string | null | undefined>) {
     return [...new Set(jids.map((jid) => this.normalizeJid(jid)).filter((jid): jid is string => !!jid))];
+  }
+
+  private isPnJid(jid?: string | null) {
+    const normalizedJid = this.normalizeJid(jid);
+    return !!normalizedJid && normalizedJid.includes('@s.whatsapp.net');
+  }
+
+  private extractLidPnMapping(left?: string | null, right?: string | null) {
+    const normalizedLeft = this.normalizeJid(left);
+    const normalizedRight = this.normalizeJid(right);
+
+    if (!normalizedLeft || !normalizedRight || normalizedLeft === normalizedRight) {
+      return null;
+    }
+
+    if (this.isLidJid(normalizedLeft) && this.isPnJid(normalizedRight)) {
+      return { lid: normalizedLeft, pn: normalizedRight };
+    }
+
+    if (this.isPnJid(normalizedLeft) && this.isLidJid(normalizedRight)) {
+      return { lid: normalizedRight, pn: normalizedLeft };
+    }
+
+    return null;
+  }
+
+  private dedupeLidPnMappings(
+    mappings: Array<{ lid?: string | null; pn?: string | null } | null | undefined>,
+  ): Array<{ lid: string; pn: string }> {
+    const dedupedMappings = new Map<string, { lid: string; pn: string }>();
+
+    for (const mapping of mappings) {
+      const lid = this.normalizeJid(mapping?.lid);
+      const pn = this.normalizeJid(mapping?.pn);
+
+      if (!lid || !pn || !this.isLidJid(lid) || !this.isPnJid(pn)) {
+        continue;
+      }
+
+      dedupedMappings.set(`${lid}|${pn}`, { lid, pn });
+    }
+
+    return [...dedupedMappings.values()];
+  }
+
+  private extractIdentityMappingsFromKey(key: Partial<ExtendedIMessageKey> | undefined) {
+    if (!key) {
+      return [];
+    }
+
+    return this.dedupeLidPnMappings([
+      this.extractLidPnMapping(key.remoteJid, key.remoteJidAlt),
+      this.extractLidPnMapping(key.participant, key.participantAlt),
+    ]);
+  }
+
+  private async ingestIdentityMappings(
+    mappings: Array<{ lid?: string | null; pn?: string | null }>,
+    options: { reconcileDatabase?: boolean; syncMessages?: boolean } = {},
+  ) {
+    const normalizedMappings = this.dedupeLidPnMappings(mappings);
+
+    if (!normalizedMappings.length) {
+      return [];
+    }
+
+    const nativeStoreMappings = (this.client?.signalRepository?.lidMapping as any)?.storeLIDPNMappings;
+
+    if (nativeStoreMappings) {
+      try {
+        await nativeStoreMappings.call(this.client.signalRepository.lidMapping, normalizedMappings);
+      } catch (error) {
+        this.logger.debug({
+          message: 'Failed to persist LID-PN mappings using native Baileys mapping store',
+          count: normalizedMappings.length,
+          error: error?.toString?.() ?? String(error),
+        });
+      }
+    }
+
+    await saveOnWhatsappCache(
+      normalizedMappings.map(({ lid, pn }) => ({
+        remoteJid: pn,
+        remoteJidAlt: lid,
+        lid: 'lid' as const,
+      })),
+    );
+
+    if (options.reconcileDatabase === false) {
+      return normalizedMappings;
+    }
+
+    await eachWithConcurrencyLimit(normalizedMappings, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async ({ lid, pn }) => {
+      await this.reconcileIdentityAliases(
+        {
+          remoteJid: pn,
+          remoteJidAlt: lid,
+          remoteLid: lid,
+        },
+        {
+          syncMessages: options.syncMessages ?? true,
+        },
+      );
+    });
+
+    return normalizedMappings;
+  }
+
+  private buildMessageIdentityLookupKey(key: Partial<ExtendedIMessageKey> | undefined) {
+    const id = key?.id;
+
+    if (!id) {
+      return undefined;
+    }
+
+    const remoteJid = this.normalizeJid(key.remoteJid) ?? this.normalizeJid(key.remoteJidAlt) ?? '';
+    const participant = this.normalizeJid(key.participant) ?? this.normalizeJid(key.participantAlt) ?? '';
+    const fromMe = key.fromMe === true ? '1' : '0';
+
+    return [id, fromMe, remoteJid, participant].join('|');
+  }
+
+  private storedMessageMatchesKey(
+    message: Partial<Message> | null | undefined,
+    key: Partial<ExtendedIMessageKey> | undefined,
+    searchId?: string,
+  ) {
+    if (!message?.key || !key) {
+      return false;
+    }
+
+    const storedKey = message.key as ExtendedIMessageKey;
+    const expectedId = searchId ?? key.id;
+
+    if (expectedId && storedKey.id !== expectedId) {
+      return false;
+    }
+
+    if (typeof key.fromMe === 'boolean' && storedKey.fromMe !== key.fromMe) {
+      return false;
+    }
+
+    const remoteJidCandidates = this.uniqueNormalizedJids(key.remoteJid, key.remoteJidAlt);
+    const storedRemoteJids = this.uniqueNormalizedJids(storedKey.remoteJid, storedKey.remoteJidAlt);
+    if (remoteJidCandidates.length && !storedRemoteJids.some((candidate) => remoteJidCandidates.includes(candidate))) {
+      return false;
+    }
+
+    const participantCandidates = this.uniqueNormalizedJids(key.participant, key.participantAlt);
+    const storedParticipants = this.uniqueNormalizedJids(storedKey.participant, storedKey.participantAlt);
+    if (
+      participantCandidates.length &&
+      !storedParticipants.some((candidate) => participantCandidates.includes(candidate))
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private async findStoredMessageByKey(
+    key: Partial<ExtendedIMessageKey> | undefined,
+    options: { searchId?: string } = {},
+  ) {
+    const searchId = options.searchId ?? key?.id;
+
+    if (!searchId) {
+      return null;
+    }
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let messages: any[];
+
+    if (provider === 'mysql') {
+      messages = (await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+        AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${searchId}
+        LIMIT 25
+      `) as any[];
+    } else {
+      messages = (await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+        AND "key"->>'id' = ${searchId}
+        LIMIT 25
+      `) as any[];
+    }
+
+    if (!messages.length) {
+      return null;
+    }
+
+    return messages.find((message) => this.storedMessageMatchesKey(message, key, searchId)) ?? messages[0] ?? null;
   }
 
   private buildIdentityCandidates(
@@ -437,6 +630,25 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return resolution;
+  }
+
+  private async resolveMessageContactIdentity(message: WAMessage) {
+    const keyAny = message.key as ExtendedIMessageKey & { remoteLid?: string };
+    const remoteJid = this.normalizeJid(keyAny.remoteJid);
+
+    if (
+      remoteJid &&
+      (isJidGroup(remoteJid) || isJidBroadcast(remoteJid)) &&
+      (keyAny.participant || keyAny.participantAlt)
+    ) {
+      return this.resolveCanonicalJidWithNative(keyAny.participant, keyAny.participantAlt, {
+        remoteLid: this.isLidJid(keyAny.participant) ? keyAny.participant : keyAny.participantAlt,
+      });
+    }
+
+    return this.resolveCanonicalJidWithNative(keyAny.remoteJid, keyAny.remoteJidAlt, {
+      remoteLid: keyAny.remoteLid,
+    });
   }
 
   private async findBestContactByJids(jids: Array<string | null | undefined>) {
@@ -544,8 +756,22 @@ export class BaileysStartupService extends ChannelStartupService {
     if (resolution.addressingMode) {
       (key as any).addressingMode = resolution.addressingMode;
     }
-    if (key.participant) {
-      key.participant = this.normalizeJid(key.participant);
+    if (key.participant || key.participantAlt) {
+      const participantResolution = this.resolveCanonicalJid(key.participant, key.participantAlt, {
+        remoteLid: this.isLidJid(key.participant) ? key.participant : key.participantAlt,
+      });
+
+      if (participantResolution.remoteJid) {
+        key.participant = participantResolution.remoteJid;
+      } else if (key.participant) {
+        key.participant = this.normalizeJid(key.participant);
+      }
+
+      if (participantResolution.remoteJidAlt) {
+        key.participantAlt = participantResolution.remoteJidAlt;
+      } else {
+        delete key.participantAlt;
+      }
     }
 
     return key;
@@ -557,6 +783,11 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     if (!key) {
       return key;
+    }
+
+    const extractedMappings = this.extractIdentityMappingsFromKey(key);
+    if (extractedMappings.length) {
+      await this.ingestIdentityMappings(extractedMappings, { reconcileDatabase: false });
     }
 
     const resolution = await this.resolveCanonicalJidWithNative(key.remoteJid, key.remoteJidAlt, {
@@ -578,8 +809,22 @@ export class BaileysStartupService extends ChannelStartupService {
     if (resolution.addressingMode) {
       (key as any).addressingMode = resolution.addressingMode;
     }
-    if (key.participant) {
-      key.participant = this.normalizeJid(key.participant);
+    if (key.participant || key.participantAlt) {
+      const participantResolution = await this.resolveCanonicalJidWithNative(key.participant, key.participantAlt, {
+        remoteLid: this.isLidJid(key.participant) ? key.participant : key.participantAlt,
+      });
+
+      if (participantResolution.remoteJid) {
+        key.participant = participantResolution.remoteJid;
+      } else if (key.participant) {
+        key.participant = this.normalizeJid(key.participant);
+      }
+
+      if (participantResolution.remoteJidAlt) {
+        key.participantAlt = participantResolution.remoteJidAlt;
+      } else {
+        delete key.participantAlt;
+      }
     }
 
     return key;
@@ -1302,47 +1547,33 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+      const storedMessage = (await this.findStoredMessageByKey(
+        key as ExtendedIMessageKey,
+      )) as proto.IWebMessageInfo | null;
 
-      let webMessageInfo: proto.IWebMessageInfo[];
-
-      if (provider === 'mysql') {
-        // MySQL version
-        webMessageInfo = (await this.prismaRepository.$queryRaw`
-          SELECT * FROM Message
-          WHERE instanceId = ${this.instanceId}
-          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
-          LIMIT 1
-        `) as proto.IWebMessageInfo[];
-      } else {
-        // PostgreSQL version
-        webMessageInfo = (await this.prismaRepository.$queryRaw`
-          SELECT * FROM "Message"
-          WHERE "instanceId" = ${this.instanceId}
-          AND "key"->>'id' = ${key.id}
-          LIMIT 1
-        `) as proto.IWebMessageInfo[];
+      if (!storedMessage) {
+        return { conversation: '' };
       }
 
       if (full) {
-        return webMessageInfo[0];
+        return storedMessage;
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
-        const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
+      if (storedMessage.message?.pollCreationMessage) {
+        const messageSecretBase64 = storedMessage.message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
           const messageSecret = Buffer.from(messageSecretBase64, 'base64');
 
           const msg = {
             messageContextInfo: { messageSecret },
-            pollCreationMessage: webMessageInfo[0].message?.pollCreationMessage,
+            pollCreationMessage: storedMessage.message?.pollCreationMessage,
           };
 
           return msg;
         }
       }
 
-      return webMessageInfo[0].message;
+      return storedMessage.message;
     } catch {
       return { conversation: '' };
     }
@@ -1824,6 +2055,7 @@ export class BaileysStartupService extends ChannelStartupService {
       messages,
       chats,
       contacts,
+      lidPnMappings,
       isLatest,
       progress,
       syncType,
@@ -1831,6 +2063,7 @@ export class BaileysStartupService extends ChannelStartupService {
       chats: Chat[];
       contacts: Contact[];
       messages: WAMessage[];
+      lidPnMappings?: Array<{ lid?: string | null; pn?: string | null }>;
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
@@ -1853,33 +2086,35 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const instance: InstanceDto = { instanceName: this.instance.name };
 
-        let timestampLimitToImport = null;
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-          const daysLimitToImport = this.localChatwoot?.enabled ? this.localChatwoot.daysLimitImportMessages : 1000;
-
-          const date = new Date();
-          timestampLimitToImport = new Date(date.setDate(date.getDate() - daysLimitToImport)).getTime() / 1000;
-
-          const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
-
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport;
-
-          if (!processBatch) {
-            return;
-          }
-        }
+        // Chatwoot history import currently runs without a day-window cutoff.
+        // We keep the config field for future rollback, but do not enforce it here.
+        const timestampLimitToImport = null;
 
         const contactsMap = new Map();
         const contactsMapLidJid = new Map();
+        const historyMappings = this.dedupeLidPnMappings([
+          ...((lidPnMappings ?? []) as Array<{ lid?: string | null; pn?: string | null }>),
+          ...contacts.map((contact) => ({
+            lid: this.isLidJid(contact.id) ? contact.id : ((contact as any)?.lid ?? undefined),
+            pn: contact.phoneNumber,
+          })),
+          ...chats.map((chat) => this.extractLidPnMapping(chat.id, (chat as any)?.accountLid)),
+        ]);
+
+        if (historyMappings.length) {
+          await this.ingestIdentityMappings(historyMappings, {
+            reconcileDatabase: true,
+            syncMessages: false,
+          });
+        }
+
+        const historyMappingByLid = new Map(historyMappings.map(({ lid, pn }) => [lid, pn] as const));
 
         for (const contact of contacts) {
           let jid = null;
 
           if (contact?.id?.search('@lid') !== -1) {
-            if (contact.phoneNumber) {
-              jid = contact.phoneNumber;
-            }
+            jid = contact.phoneNumber ?? historyMappingByLid.get(contact.id) ?? null;
           }
 
           if (!jid) {
@@ -1888,9 +2123,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (contact.id && (contact.notify || contact.name)) {
             contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid });
+            if (jid && jid !== contact.id) {
+              contactsMap.set(jid, { name: contact.name ?? contact.notify, jid });
+            }
           }
 
           contactsMapLidJid.set(contact.id, { jid });
+          if (jid && jid !== contact.id) {
+            contactsMapLidJid.set(jid, { jid });
+          }
         }
 
         const chatsRepository = new Set(
@@ -1934,11 +2175,11 @@ export class BaileysStartupService extends ChannelStartupService {
                 select: { key: true },
                 where: { instanceId: this.instanceId },
               })
-            ).map((message) => {
-              const key = message.key as { id: string };
-
-              return key.id;
-            }),
+            )
+              .map((message) => {
+                return this.buildMessageIdentityLookupKey(message.key as ExtendedIMessageKey);
+              })
+              .filter((messageKey): messageKey is string => !!messageKey),
         );
 
         if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
@@ -1954,13 +2195,7 @@ export class BaileysStartupService extends ChannelStartupService {
             m.messageTimestamp = m.messageTimestamp?.toNumber();
           }
 
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-            if (m.messageTimestamp <= timestampLimitToImport) {
-              continue;
-            }
-          }
-
-          if (messagesRepository?.has(m.key.id)) {
+          if (timestampLimitToImport !== null && m.messageTimestamp <= timestampLimitToImport) {
             continue;
           }
 
@@ -1992,12 +2227,22 @@ export class BaileysStartupService extends ChannelStartupService {
             keyAny.addressingMode = historicalIdentity.addressingMode;
           }
 
-          messagesRaw.push(
-            await this.prepareMessageWithNative(m, {
-              phoneNumber: contactsMapLidJid.get(keyAny.remoteJid)?.jid,
-              remoteLid: keyAny.remoteLid,
-            }),
-          );
+          const historyMessageKey = this.buildMessageIdentityLookupKey(keyAny);
+          if (historyMessageKey && messagesRepository?.has(historyMessageKey)) {
+            continue;
+          }
+
+          const preparedMessage = await this.prepareMessageWithNative(m, {
+            phoneNumber: contactsMapLidJid.get(keyAny.remoteJid)?.jid,
+            remoteLid: keyAny.remoteLid,
+          });
+
+          messagesRaw.push(preparedMessage);
+
+          const preparedMessageKey = this.buildMessageIdentityLookupKey(preparedMessage.key as ExtendedIMessageKey);
+          if (preparedMessageKey) {
+            messagesRepository.add(preparedMessageKey);
+          }
         }
 
         this.historySyncMessageCount += messagesRaw.length;
@@ -2023,16 +2268,9 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        const filteredContacts = contacts.filter((c) => !!c.notify || !!c.name);
-        this.historySyncContactCount += filteredContacts.length;
+        this.historySyncContactCount += contacts.length;
 
-        await this.contactHandle['contacts.upsert'](
-          filteredContacts.map((c) => ({
-            id: c.id,
-            name: c.name ?? c.notify,
-            phoneNumber: (c as any).phoneNumber,
-          })) as Contact[],
-        );
+        await this.contactHandle['contacts.upsert'](contacts as Contact[]);
 
         if (progress === 100) {
           this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
@@ -2467,14 +2705,13 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
-          const contactIdentity = await this.resolveCanonicalJidWithNative(
+          const contactIdentity = await this.resolveMessageContactIdentity(received);
+          const contactCandidates = this.buildIdentityCandidates(
+            contactIdentity,
             received.key.remoteJid,
-            (received.key as any).remoteJidAlt,
-            {
-              remoteLid: (received.key as any).remoteLid,
-            },
+            received.key.participant,
+            (received.key as any).participantAlt,
           );
-          const contactCandidates = this.buildIdentityCandidates(contactIdentity, received.key.remoteJid);
           const contactRemoteJid = contactIdentity.remoteJid;
           if (!contactRemoteJid || contactRemoteJid === 'status@broadcast') {
             continue;
@@ -2620,7 +2857,6 @@ export class BaileysStartupService extends ChannelStartupService {
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
-            // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
             const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
 
@@ -2629,25 +2865,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             const searchId = originalMessageId || key.id;
-            const dbProvider = this.configService.get<Database>('DATABASE').PROVIDER;
-
-            let messages: any[];
-            if (dbProvider === 'mysql') {
-              messages = (await this.prismaRepository.$queryRaw`
-                SELECT * FROM Message
-                WHERE instanceId = ${this.instanceId}
-                AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${searchId}
-                LIMIT 1
-              `) as any[];
-            } else {
-              messages = (await this.prismaRepository.$queryRaw`
-                SELECT * FROM "Message"
-                WHERE "instanceId" = ${this.instanceId}
-                AND "key"->>'id' = ${searchId}
-                LIMIT 1
-              `) as any[];
-            }
-            findMessage = messages[0] || null;
+            findMessage = await this.findStoredMessageByKey(key as ExtendedIMessageKey, { searchId });
 
             if (!findMessage?.id) {
               this.logger.verbose(
@@ -2955,8 +3173,11 @@ export class BaileysStartupService extends ChannelStartupService {
               const remotesJidMap: Record<string, number> = {};
 
               for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                const keyAny = event.key as ExtendedIMessageKey;
+                await this.applyCanonicalKeyIdentityWithNative(keyAny);
+
+                if (typeof keyAny.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                  remotesJidMap[keyAny.remoteJid] = event.receipt.readTimestamp;
                 }
               }
 
@@ -2965,6 +3186,11 @@ export class BaileysStartupService extends ChannelStartupService {
                   this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
                 ),
               );
+            }
+
+            if (events['lid-mapping.update']) {
+              const payload = events['lid-mapping.update'] as { lid?: string | null; pn?: string | null };
+              await this.ingestIdentityMappings([payload], { reconcileDatabase: true, syncMessages: true });
             }
 
             if (events['presence.update']) {
@@ -2990,44 +3216,44 @@ export class BaileysStartupService extends ChannelStartupService {
 
               if (events['group-participants.update']) {
                 const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
+                await this.groupHandler['group-participants.update'](payload);
               }
             }
 
             if (events['chats.upsert']) {
               const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
+              await this.chatHandle['chats.upsert'](payload);
             }
 
             if (events['chats.update']) {
               const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
+              await this.chatHandle['chats.update'](payload);
             }
 
             if (events['chats.delete']) {
               const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
+              await this.chatHandle['chats.delete'](payload);
             }
 
             if (events['contacts.upsert']) {
               const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
+              await this.contactHandle['contacts.upsert'](payload);
             }
 
             if (events['contacts.update']) {
               const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
+              await this.contactHandle['contacts.update'](payload);
             }
 
             if (events[Events.LABELS_ASSOCIATION]) {
               const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+              await this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
               return;
             }
 
             if (events[Events.LABELS_EDIT]) {
               const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
+              await this.labelHandle[Events.LABELS_EDIT](payload);
               return;
             }
           }
@@ -6492,8 +6718,17 @@ export class BaileysStartupService extends ChannelStartupService {
         ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant || keyFilters?.participantAlt
+            ? {
+                OR: [
+                  keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+                  keyFilters?.participantAlt
+                    ? { key: { path: ['participantAlt'], equals: keyFilters?.participantAlt } }
+                    : {},
+                ],
+              }
+            : {},
           {
             OR: [
               keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
@@ -6521,8 +6756,17 @@ export class BaileysStartupService extends ChannelStartupService {
         ...timestampFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          typeof keyFilters?.fromMe === 'boolean' ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant || keyFilters?.participantAlt
+            ? {
+                OR: [
+                  keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+                  keyFilters?.participantAlt
+                    ? { key: { path: ['participantAlt'], equals: keyFilters?.participantAlt } }
+                    : {},
+                ],
+              }
+            : {},
           {
             OR: [
               keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},

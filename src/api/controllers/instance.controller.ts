@@ -183,7 +183,7 @@ export class InstanceController {
         alwaysOnline: instanceData.alwaysOnline === true,
         readMessages: instanceData.readMessages === true,
         readStatus: instanceData.readStatus === true,
-        syncFullHistory: instanceData.syncFullHistory === true,
+        syncFullHistory: true,
         wavoipToken: instanceData.wavoipToken || '',
       };
 
@@ -295,7 +295,7 @@ export class InstanceController {
           importContacts: instanceData.chatwootImportContacts ?? true,
           mergeBrazilContacts: instanceData.chatwootMergeBrazilContacts ?? false,
           importMessages: instanceData.chatwootImportMessages ?? true,
-          daysLimitImportMessages: instanceData.chatwootDaysLimitImportMessages ?? 60,
+          daysLimitImportMessages: instanceData.chatwootDaysLimitImportMessages ?? 0,
           organization: instanceData.chatwootOrganization,
           logo: instanceData.chatwootLogo,
           autoCreate: instanceData.chatwootAutoCreate !== false,
@@ -347,7 +347,7 @@ export class InstanceController {
           mergeBrazilContacts: instanceData.chatwootMergeBrazilContacts ?? false,
           importContacts: instanceData.chatwootImportContacts ?? true,
           importMessages: instanceData.chatwootImportMessages ?? true,
-          daysLimitImportMessages: instanceData.chatwootDaysLimitImportMessages || 60,
+          daysLimitImportMessages: instanceData.chatwootDaysLimitImportMessages ?? 0,
           number: instanceData.number,
           nameInbox: instanceData.chatwootNameInbox ?? instance.instanceName,
           webhookUrl: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,

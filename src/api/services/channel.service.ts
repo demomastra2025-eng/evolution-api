@@ -732,8 +732,10 @@ export class ChannelStartupService {
     }
 
     const provider = this.configService.get<Database>('DATABASE').PROVIDER;
-    const limit = query?.take ? Prisma.sql`LIMIT ${query.take}` : Prisma.sql``;
-    const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
+    const take = query?.offset ? Number(query.offset) : null;
+    const skip = query?.page ? Number(query.offset) * (Math.max(Number(query.page), 1) - 1) : null;
+    const limit = take ? Prisma.sql`LIMIT ${take}` : Prisma.sql``;
+    const offset = skip ? Prisma.sql`OFFSET ${skip}` : Prisma.sql``;
 
     let results: any[];
 

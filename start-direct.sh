@@ -88,5 +88,5 @@ echo "Running database migrations"
 npm run db:deploy
 
 echo "Starting Evolution API directly on http://127.0.0.1:8080"
-echo "Public manager can be started separately on http://127.0.0.1:3001"
+echo "Built-in manager is available at http://127.0.0.1:8080/manager/"
 npm run start

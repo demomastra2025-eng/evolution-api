@@ -3068,7 +3068,7 @@ export class ChatwootService {
         await this.prismaRepository.contact.findMany({
           where: {
             instanceId: instance.instanceId,
-            id: {
+            remoteJid: {
               in: contactIdentifiers,
             },
             profilePicUrl: {
@@ -3076,7 +3076,10 @@ export class ChatwootService {
             },
           },
         })
-      ).reduce((acc: Map<string, ContactModel>, contact: ContactModel) => acc.set(contact.id, contact), new Map());
+      ).reduce(
+        (acc: Map<string, ContactModel>, contact: ContactModel) => acc.set(contact.remoteJid, contact),
+        new Map(),
+      );
 
       recentContacts.forEach(async (contact) => {
         if (contactsWithProfilePicture.has(contact.identifier)) {
