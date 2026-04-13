@@ -1389,7 +1389,39 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       if (shouldReconnect) {
+        this.stateConnection = {
+          state: 'reconnecting',
+          statusReason: statusCode ?? 200,
+        };
+
+        const persisted = await this.updateInstanceRecord(
+          {
+            connectionStatus: 'connecting',
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: statusCode,
+            disconnectionObject: JSON.stringify(lastDisconnect),
+          },
+          'connection.reconnecting',
+        );
+        if (!persisted) {
+          return;
+        }
+
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+          instance: this.instance.name,
+          ...this.stateConnection,
+        });
+
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+          this.chatwootService.eventWhatsapp(
+            Events.CONNECTION_UPDATE,
+            { instanceName: this.instance.name, instanceId: this.instanceId },
+            { instance: this.instance.name, status: 'reconnecting' },
+          );
+        }
+
         this.scheduleReconnect();
+        return;
       } else {
         this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -1485,6 +1517,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'connecting') {
+      const persisted = await this.updateInstanceRecord({ connectionStatus: 'connecting' }, 'connection.connecting');
+      if (!persisted) {
+        return;
+      }
+
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
   }
@@ -5148,10 +5185,13 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
+        if (read.remoteJid?.includes('@') && !read.remoteJid.includes('@broadcast')) {
           keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
         }
       });
+      if (keys.length === 0) {
+        return { message: 'No valid message keys to mark as read', read: 'skipped' };
+      }
       await this.client.readMessages(keys);
       return { message: 'Read messages', read: 'success' };
     } catch (error) {
@@ -5709,7 +5749,9 @@ export class BaileysStartupService extends ChannelStartupService {
         if (oldMessage?.key?.remoteJid !== jid) {
           throw new BadRequestException('RemoteJid does not match');
         }
-        if (oldMessage?.messageTimestamp > Date.now() + 900000) {
+        const messageTimestamp = Number(oldMessage?.messageTimestamp || 0);
+        const messageTimestampMs = messageTimestamp > 1000000000000 ? messageTimestamp : messageTimestamp * 1000;
+        if (messageTimestampMs > 0 && Date.now() - messageTimestampMs > 900000) {
           // 15 minutes in milliseconds
           throw new BadRequestException('Message is older than 15 minutes');
         }

@@ -127,7 +127,7 @@ export declare namespace wa {
 
   export type StateConnection = {
     instance?: string;
-    state?: WAConnectionState | 'refused';
+    state?: WAConnectionState | 'refused' | 'reconnecting';
     statusReason?: number;
   };
 

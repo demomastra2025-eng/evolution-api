@@ -1395,37 +1395,65 @@ export class ChatwootService {
     }
   }
 
-  public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
+  private resolveChatwootAttachmentType(typeHint?: string, contentType?: string) {
+    const normalizedType = (typeHint || '').toLowerCase();
+    if (normalizedType === 'image') return 'image';
+    if (normalizedType === 'video') return 'video';
+    if (normalizedType === 'audio') return 'audio';
+    if (normalizedType === 'file') return 'document';
+
+    const normalizedContentType = (contentType || '').split(';')[0].trim().toLowerCase();
+    switch (normalizedContentType.split('/')[0]) {
+      case 'image':
+        return 'image';
+      case 'video':
+        return 'video';
+      case 'audio':
+        return 'audio';
+      default:
+        return null;
+    }
+  }
+
+  public async sendAttachment(
+    waInstance: any,
+    number: string,
+    media: any,
+    caption?: string,
+    options?: Options,
+    attachmentMeta?: {
+      content_type?: string;
+      contentType?: string;
+      file_type?: string;
+      fileType?: string;
+      file_name?: string;
+      filename?: string;
+    },
+  ) {
     try {
       const parsedMedia = path.parse(decodeURIComponent(media));
-      let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-      let fileName = parsedMedia?.name + parsedMedia?.ext;
+      let mimeType =
+        attachmentMeta?.content_type || attachmentMeta?.contentType || mimeTypes.lookup(parsedMedia?.ext) || '';
+      let fileName = attachmentMeta?.filename || attachmentMeta?.file_name || parsedMedia?.name + parsedMedia?.ext;
+      let type =
+        this.resolveChatwootAttachmentType(
+          attachmentMeta?.file_type || attachmentMeta?.fileType,
+          mimeType?.toString(),
+        ) || 'document';
 
-      if (!mimeType) {
+      if (!mimeType || type === 'document') {
         const parts = media.split('/');
-        fileName = decodeURIComponent(parts[parts.length - 1]);
+        fileName = attachmentMeta?.filename || attachmentMeta?.file_name || decodeURIComponent(parts[parts.length - 1]);
 
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
-        mimeType = response.headers['content-type'];
-      }
-
-      let type = 'document';
-
-      switch (mimeType.split('/')[0]) {
-        case 'image':
-          type = 'image';
-          break;
-        case 'video':
-          type = 'video';
-          break;
-        case 'audio':
-          type = 'audio';
-          break;
-        default:
-          type = 'document';
-          break;
+        mimeType = mimeType || response.headers['content-type'] || '';
+        type =
+          this.resolveChatwootAttachmentType(
+            attachmentMeta?.file_type || attachmentMeta?.fileType,
+            mimeType?.toString(),
+          ) || type;
       }
 
       if (type === 'audio') {
@@ -1685,6 +1713,11 @@ export class ChatwootService {
                 attachment.data_url,
                 formatText,
                 options,
+                {
+                  file_type: attachment.file_type,
+                  content_type: attachment.content_type,
+                  filename: attachment.filename,
+                },
               );
               if (!messageSent && body.conversation?.id) {
                 this.onSendMessageError(instance, body.conversation?.id);
