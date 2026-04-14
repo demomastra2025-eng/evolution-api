@@ -1396,7 +1396,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const persisted = await this.updateInstanceRecord(
           {
-            connectionStatus: 'connecting',
+            connectionStatus: 'reconnecting',
             disconnectionAt: new Date(),
             disconnectionReasonCode: statusCode,
             disconnectionObject: JSON.stringify(lastDisconnect),
@@ -1711,7 +1711,10 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
       maxMsgRetryCount: 4,
-      fireInitQueries: true,
+      // These startup queries are optional and currently rejected by WA
+      // for part of our multi-device sessions, which only adds noisy
+      // "unexpected error in 'init queries'" logs without improving runtime state.
+      fireInitQueries: false,
       connectTimeoutMs: 30_000,
       keepAliveIntervalMs: 30_000,
       qrTimeout: 45_000,
@@ -1795,7 +1798,7 @@ export class BaileysStartupService extends ChannelStartupService {
       return this.connectInFlight;
     }
 
-    if (this.client && ['open', 'connecting'].includes(this.stateConnection.state)) {
+    if (this.client && ['open', 'connecting', 'reconnecting'].includes(this.stateConnection.state)) {
       this.logger.info({
         message: 'Instance already connected or connecting, skipping duplicate connect',
         instanceName: this.instance.name,

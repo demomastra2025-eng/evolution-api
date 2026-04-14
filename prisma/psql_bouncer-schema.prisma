@@ -18,6 +18,7 @@ enum InstanceConnectionStatus {
   open
   close
   connecting
+  reconnecting
 }
 
 enum DeviceMessage {

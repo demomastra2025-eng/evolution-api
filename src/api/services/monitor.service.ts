@@ -55,7 +55,7 @@ export class WAMonitoringService {
         async () => {
           try {
             if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
-              if (this.waInstances[instance]?.connectionStatus?.state === 'connecting') {
+              if (['connecting', 'reconnecting'].includes(this.waInstances[instance]?.connectionStatus?.state)) {
                 if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
                   await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
                   this.waInstances[instance]?.client?.ws?.close();
@@ -293,7 +293,11 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
-    if (instanceData.connectionStatus === 'open' || instanceData.connectionStatus === 'connecting') {
+    if (
+      instanceData.connectionStatus === 'open' ||
+      instanceData.connectionStatus === 'connecting' ||
+      instanceData.connectionStatus === 'reconnecting'
+    ) {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
