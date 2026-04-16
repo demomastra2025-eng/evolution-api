@@ -38,6 +38,8 @@ export class InstanceController {
   ) {}
 
   private readonly logger = new Logger('InstanceController');
+  private static readonly CONNECT_OUTCOME_TIMEOUT_MS = 12000;
+  private static readonly CONNECT_OUTCOME_POLL_MS = 500;
 
   private async cleanupOrphanedRuntime(instanceName: string) {
     this.logger.warn({
@@ -362,7 +364,15 @@ export class InstanceController {
 
   public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
     try {
-      const instance = this.waMonitor.waInstances[instanceName];
+      const instance = this.waMonitor.waInstances[instanceName] as
+        | (wa.Instance & {
+            qrCode?: wa.QrCode;
+            connectionStatus?: { state?: string; statusReason?: number };
+            connectToWhatsapp?: (number?: string) => Promise<unknown>;
+            prepareForFreshConnectAttempt?: () => void;
+            hasAuthenticationArtifacts?: () => boolean;
+          })
+        | undefined;
       const state = instance?.connectionStatus?.state;
 
       if (!state) {
@@ -374,23 +384,19 @@ export class InstanceController {
       }
 
       if (state == 'connecting') {
-        return instance.qrCode;
+        await this.waitForConnectOutcome(instance);
+        return this.connectOutcomeResponse(instanceName, instance);
       }
 
       if (state == 'close') {
+        instance.prepareForFreshConnectAttempt?.();
         await instance.connectToWhatsapp(number);
-
-        await delay(2000);
-        return instance.qrCode;
+        await this.waitForConnectOutcome(instance);
+        return this.connectOutcomeResponse(instanceName, instance);
       }
 
-      return {
-        instance: {
-          instanceName: instanceName,
-          status: state,
-        },
-        qrcode: instance?.qrCode,
-      };
+      await this.waitForConnectOutcome(instance, 3000);
+      return this.connectOutcomeResponse(instanceName, instance);
     } catch (error) {
       this.logger.error(error);
       return { error: true, message: error.toString() };
@@ -415,12 +421,10 @@ export class InstanceController {
         await instance.restart();
         // Wait a bit for the reconnection to be established
         await new Promise((r) => setTimeout(r, 2000));
-        return {
-          instance: {
-            instanceName: instanceName,
-            status: instance.connectionStatus?.state || 'connecting',
-          },
-        };
+        return await this.connectToWhatsapp({
+          instanceName,
+          number: instance.phoneNumber || null,
+        });
       }
 
       // Fallback for Baileys (uses different mechanism)
@@ -465,6 +469,115 @@ export class InstanceController {
         instanceName: instanceName,
         state: runtimeInstance.connectionStatus?.state,
       },
+    };
+  }
+
+  private hasAuthenticationArtifacts(
+    instance:
+      | (wa.Instance & {
+          qrCode?: wa.QrCode;
+          hasAuthenticationArtifacts?: () => boolean;
+        })
+      | undefined,
+  ) {
+    if (!instance) {
+      return false;
+    }
+
+    if (typeof instance.hasAuthenticationArtifacts === 'function') {
+      return instance.hasAuthenticationArtifacts();
+    }
+
+    return Boolean(instance.qrCode?.base64 || instance.qrCode?.code || instance.qrCode?.pairingCode);
+  }
+
+  private async waitForConnectOutcome(
+    instance:
+      | (wa.Instance & {
+          qrCode?: wa.QrCode;
+          connectionStatus?: { state?: string };
+          hasAuthenticationArtifacts?: () => boolean;
+        })
+      | undefined,
+    timeoutMs = InstanceController.CONNECT_OUTCOME_TIMEOUT_MS,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (!instance) {
+        return;
+      }
+
+      const state = instance.connectionStatus?.state;
+      if (state === 'open' || this.hasAuthenticationArtifacts(instance)) {
+        return;
+      }
+
+      await delay(InstanceController.CONNECT_OUTCOME_POLL_MS);
+    }
+  }
+
+  private connectOutcomeResponse(
+    instanceName: string,
+    instance:
+      | (wa.Instance & {
+          qrCode?: wa.QrCode;
+          connectionStatus?: { state?: string; statusReason?: number };
+          hasAuthenticationArtifacts?: () => boolean;
+        })
+      | undefined,
+  ) {
+    const state = instance?.connectionStatus?.state ?? 'close';
+    const hasAuthArtifacts = this.hasAuthenticationArtifacts(instance);
+    const statusCode = instance?.connectionStatus?.statusReason;
+
+    if (state === 'open') {
+      return {
+        instance: {
+          instanceName,
+          state: 'open',
+          status: 'open',
+        },
+      };
+    }
+
+    if (hasAuthArtifacts) {
+      return {
+        instance: {
+          instanceName,
+          state: state === 'close' ? 'connecting' : state,
+          status: 'qr_ready',
+        },
+        qrcode: instance?.qrCode,
+      };
+    }
+
+    const reauthRequired = state === 'close' || statusCode === 401 || statusCode === 428;
+    if (reauthRequired) {
+      return {
+        instance: {
+          instanceName,
+          state: 'close',
+          status: 'reauth_required',
+        },
+        status: 'reauth_required',
+        message: 'Authentication artifacts were not generated after reconnect',
+        statusCode,
+        auth: {
+          recoveryRequired: true,
+          hasAuthenticationArtifacts: false,
+        },
+        qrcode: instance?.qrCode ?? { count: 0 },
+      };
+    }
+
+    return {
+      instance: {
+        instanceName,
+        state,
+        status: state,
+      },
+      qrcode: instance?.qrCode,
     };
   }
 

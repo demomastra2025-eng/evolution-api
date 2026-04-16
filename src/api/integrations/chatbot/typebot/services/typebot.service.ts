@@ -198,7 +198,7 @@ export class TypebotService extends BaseChatbotService<TypebotModel, any> {
       this.applyFormatting.bind(this),
       this.prismaRepository,
     ).catch((err) => {
-      console.error('Erro ao processar mensagens:', err);
+      this.logger.error({ local: 'processMessages', error: err });
     });
   }
 

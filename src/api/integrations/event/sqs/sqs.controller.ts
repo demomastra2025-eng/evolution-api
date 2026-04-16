@@ -79,7 +79,7 @@ export class SqsController extends EventController implements EventControllerInt
       },
     };
 
-    console.log('*** payload: ', payload);
+    this.logger.debug({ local: 'set', payload });
     return this.prisma[this.name].upsert(payload);
   }
 
@@ -211,7 +211,7 @@ export class SqsController extends EventController implements EventControllerInt
     if (enable) {
       const sqsConfig = configService.get<Sqs>('SQS');
       const eventsFinded = await this.listQueues(prefixName);
-      console.log('eventsFinded', eventsFinded);
+      this.logger.debug({ local: 'saveQueues', prefixName, eventsFinded });
 
       for (const event of events) {
         const normalizedEvent =

@@ -3,6 +3,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { TemplateDeleteDto, TemplateDto, TemplateEditDto } from '@api/dto/template.dto';
 import { templateController } from '@api/server.module';
 import { ConfigService } from '@config/env.config';
+import { Logger } from '@config/logger.config';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { templateDeleteSchema } from '@validate/templateDelete.schema';
 import { templateEditSchema } from '@validate/templateEdit.schema';
@@ -10,6 +11,8 @@ import { instanceSchema, templateSchema } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
+
+const logger = new Logger('TemplateRouter');
 
 export class TemplateRouter extends RouterBroker {
   constructor(
@@ -29,10 +32,7 @@ export class TemplateRouter extends RouterBroker {
 
           res.status(HttpStatus.CREATED).json(response);
         } catch (error) {
-          // Log error for debugging
-          console.error('Template creation error:', error);
-
-          // Use utility function to create standardized error response
+          logger.error({ local: 'create', error });
           const errorResponse = createMetaErrorResponse(error, 'template_creation');
           res.status(errorResponse.status).json(errorResponse);
         }
@@ -48,7 +48,7 @@ export class TemplateRouter extends RouterBroker {
 
           res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          console.error('Template edit error:', error);
+          logger.error({ local: 'edit', error });
           const errorResponse = createMetaErrorResponse(error, 'template_edit');
           res.status(errorResponse.status).json(errorResponse);
         }
@@ -64,7 +64,7 @@ export class TemplateRouter extends RouterBroker {
 
           res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          console.error('Template delete error:', error);
+          logger.error({ local: 'delete', error });
           const errorResponse = createMetaErrorResponse(error, 'template_delete');
           res.status(errorResponse.status).json(errorResponse);
         }
@@ -80,10 +80,7 @@ export class TemplateRouter extends RouterBroker {
 
           res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          // Log error for debugging
-          console.error('Template find error:', error);
-
-          // Use utility function to create standardized error response
+          logger.error({ local: 'find', error });
           const errorResponse = createMetaErrorResponse(error, 'template_find');
           res.status(errorResponse.status).json(errorResponse);
         }

@@ -177,7 +177,7 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
       // Process with the appropriate API based on bot type
       await this.sendMessageToBot(instance, session, settings, openaiBot, remoteJid, pushName || '', content, msg);
     } catch (error) {
-      this.logger.error(`Error in process: ${error.message || JSON.stringify(error)}`);
+      this.logger.error({ local: 'process', error });
       return;
     }
   }
@@ -253,9 +253,9 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
         },
       });
     } catch (error) {
-      this.logger.error(`Error in sendMessageToBot: ${error.message || JSON.stringify(error)}`);
+      this.logger.error({ local: 'sendMessageToBot', error });
       if (error.response) {
-        this.logger.error(`API Response data: ${JSON.stringify(error.response.data || {})}`);
+        this.logger.error({ local: 'sendMessageToBot.response', data: error.response.data || {} });
       }
       return;
     }
@@ -573,10 +573,10 @@ export class OpenaiService extends BaseChatbotService<OpenaiBot, OpenaiSetting> 
 
       return responseContent;
     } catch (error) {
-      this.logger.error(`Error calling OpenAI: ${error.message || JSON.stringify(error)}`);
+      this.logger.error({ local: 'callOpenAI', error });
       if (error.response) {
         this.logger.error(`API Response status: ${error.response.status}`);
-        this.logger.error(`API Response data: ${JSON.stringify(error.response.data || {})}`);
+        this.logger.error({ local: 'callOpenAI.response', data: error.response.data || {} });
       }
       return `Sorry, there was an error: ${error.message || 'Unknown error'}`;
     }

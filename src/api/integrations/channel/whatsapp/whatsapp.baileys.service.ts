@@ -316,6 +316,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncChatCount = 0;
   private historySyncContactCount = 0;
   private historySyncLastProgress = -1;
+  private initialConnectionRecoveryAttempted = false;
+  private initialConnectionRecoveryInFlight: Promise<boolean> | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -1193,32 +1195,58 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    const db = this.configService.get<Database>('DATABASE');
-    const cache = this.configService.get<CacheConf>('CACHE');
-    const provider = this.configService.get<ProviderSession>('PROVIDER');
+    await this.clearPersistedAuthState();
+  }
 
-    if (provider?.ENABLED) {
-      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+  public hasAuthenticationArtifacts(): boolean {
+    return Boolean(this.instance.qrcode?.base64 || this.instance.qrcode?.code || this.instance.qrcode?.pairingCode);
+  }
 
-      await authState.removeCreds();
+  public prepareForFreshConnectAttempt() {
+    this.initialConnectionRecoveryAttempted = false;
+  }
+
+  public async forceReauthentication(number?: string): Promise<WASocket> {
+    this.logger.warn({
+      message: 'Forcing WhatsApp auth recovery after initial close without QR',
+      instanceName: this.instance.name,
+      number: number ?? this.phoneNumber ?? this.instance.number ?? null,
+    });
+
+    this.clearScheduledReconnect();
+    this.endSession = false;
+    this.isDeleting = false;
+
+    if (this.client) {
+      try {
+        await this.client.logout('Force reauthentication');
+      } catch (error) {
+        this.logger.warn({
+          message: 'Force reauthentication logout failed',
+          error: error?.toString?.() ?? String(error),
+        });
+      }
+
+      try {
+        this.client.ws?.close();
+        this.client.end(new Error('Force reauthentication'));
+      } catch (error) {
+        this.logger.warn({
+          message: 'Force reauthentication socket cleanup failed',
+          error: error?.toString?.() ?? String(error),
+        });
+      }
     }
 
-    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
-      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+    await this.clearPersistedAuthState();
 
-      await authState.removeCreds();
-    }
+    this.instance.qrcode = { count: 0 };
+    this.instance.wuid = null;
+    this.instance.profilePictureUrl = null;
+    this.stateConnection = { state: 'close' };
+    this.phoneNumber = number ?? this.phoneNumber ?? this.instance.number;
 
-    if (db.SAVE_DATA.INSTANCE) {
-      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
-
-      await authState.removeCreds();
-    }
-
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
-    if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
-    }
+    return this.connectToWhatsapp(this.phoneNumber);
   }
 
   public async getProfileName() {
@@ -1269,6 +1297,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (qr) {
       this.clearScheduledReconnect();
+      this.initialConnectionRecoveryAttempted = false;
 
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -1375,7 +1404,12 @@ export class BaileysStartupService extends ChannelStartupService {
       const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
 
       if (isInitialConnection) {
-        this.logger.info('Initial connection closed, waiting for QR code generation...');
+        const recovered = await this.tryRecoverInitialConnectionWithoutQr(statusCode);
+        if (recovered) {
+          return;
+        }
+
+        await this.emitInitialConnectionFailure(statusCode, lastDisconnect);
         return;
       }
 
@@ -1463,6 +1497,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'open') {
       this.clearScheduledReconnect();
+      this.initialConnectionRecoveryAttempted = false;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -1541,6 +1576,121 @@ export class BaileysStartupService extends ChannelStartupService {
 
       await this.handleMissingInstanceRecord(context);
       return false;
+    }
+  }
+
+  private async clearPersistedAuthState() {
+    const db = this.configService.get<Database>('DATABASE');
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+
+    if (provider?.ENABLED) {
+      const authState = await this.authStateProvider.authStateProvider(this.instance.id);
+
+      await authState.removeCreds();
+    }
+
+    if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+      const authState = await useMultiFileAuthStateRedisDb(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    if (db.SAVE_DATA.INSTANCE) {
+      const authState = await useMultiFileAuthStatePrisma(this.instance.id, this.cache);
+
+      await authState.removeCreds();
+    }
+
+    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+    if (sessionExists) {
+      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
+    }
+  }
+
+  private async tryRecoverInitialConnectionWithoutQr(statusCode?: number): Promise<boolean> {
+    if (this.initialConnectionRecoveryInFlight) {
+      return this.initialConnectionRecoveryInFlight;
+    }
+
+    if (this.initialConnectionRecoveryAttempted) {
+      this.logger.warn({
+        message: 'Initial connection recovery already attempted and QR is still missing',
+        instanceName: this.instance.name,
+        statusCode,
+      });
+      return false;
+    }
+
+    this.initialConnectionRecoveryAttempted = true;
+
+    this.initialConnectionRecoveryInFlight = (async () => {
+      try {
+        await this.forceReauthentication(this.phoneNumber ?? this.instance.number);
+        return true;
+      } catch (error) {
+        this.logger.error({
+          message: 'Forced auth recovery failed',
+          instanceName: this.instance.name,
+          statusCode,
+          error: error?.toString?.() ?? String(error),
+        });
+        return false;
+      } finally {
+        this.initialConnectionRecoveryInFlight = null;
+      }
+    })();
+
+    return this.initialConnectionRecoveryInFlight;
+  }
+
+  private async emitInitialConnectionFailure(
+    statusCode: number | undefined,
+    lastDisconnect: Partial<ConnectionState>['lastDisconnect'],
+  ) {
+    this.logger.warn({
+      message: 'QR code was not generated after initial connection recovery',
+      instanceName: this.instance.name,
+      statusCode,
+    });
+
+    this.stateConnection = {
+      state: 'close',
+      statusReason: statusCode ?? 428,
+    };
+
+    const disconnectionAt = new Date();
+    const disconnectionObject = JSON.stringify(lastDisconnect);
+    const payload = {
+      instance: this.instance.name,
+      status: 'reauth_required',
+      message: 'Authentication artifacts were not generated after reconnect',
+      disconnectionAt,
+      disconnectionReasonCode: statusCode,
+      disconnectionObject,
+    };
+
+    this.sendDataWebhook(Events.STATUS_INSTANCE, payload);
+
+    const persisted = await this.updateInstanceRecord(
+      {
+        connectionStatus: 'close',
+        disconnectionAt,
+        disconnectionReasonCode: statusCode,
+        disconnectionObject,
+      },
+      'connection.initial-close-without-qr',
+    );
+    if (!persisted) {
+      return;
+    }
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.STATUS_INSTANCE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        payload,
+      );
     }
   }
 
@@ -1653,7 +1803,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const error = baileysVersion?.error ?? null;
     if (error) {
-      this.logger.error(`Fetch latest WaWeb version error: ${JSON.stringify({ error })}`);
+      this.logger.error({ local: 'fetchLatestWaWebVersion', error });
     }
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
@@ -1767,13 +1917,13 @@ export class BaileysStartupService extends ChannelStartupService {
     this.eventHandler();
 
     this.client.ws.on('CB:call', (packet) => {
-      console.log('CB:call', packet);
+      this.logger.debug({ local: 'socket.call', packet });
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
     this.client.ws.on('CB:ack,class:call', (packet) => {
-      console.log('CB:ack,class:call', packet);
+      this.logger.debug({ local: 'socket.callAck', packet });
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
@@ -2026,15 +2176,14 @@ export class BaileysStartupService extends ChannelStartupService {
           });
         }
       } catch (error) {
-        console.error(error);
-        this.logger.error(`Error: ${error.message}`);
+        this.logger.error({ local: 'contacts.upsert', error });
       }
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       const contactsRaw: any[] = [];
       for await (const contact of contacts) {
-        this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+        this.logger.debug({ local: 'contacts.update', contact });
         const normalizedContact = await this.normalizeContactPayload(contact as Contact);
         if (!normalizedContact) {
           continue;
@@ -2118,9 +2267,9 @@ export class BaileysStartupService extends ChannelStartupService {
         this.historySyncLastProgress = progress ?? -1;
 
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.debug({ local: 'messaging-history.set.on-demand', messages });
         }
-        console.log(
+        this.logger.info(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
@@ -2353,7 +2502,10 @@ export class BaileysStartupService extends ChannelStartupService {
               ].some((err) => param?.includes?.(err)),
             )
           ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+            this.logger.warn({
+              local: 'messages.upsert.stub-ignored',
+              received,
+            });
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
@@ -2362,14 +2514,18 @@ export class BaileysStartupService extends ChannelStartupService {
             if (text == 'requestPlaceholder' && !requestId) {
               const messageId = await this.client.requestPlaceholderResend(received.key);
 
-              console.log('requested placeholder resync, id=', messageId);
+              this.logger.debug(`Requested placeholder resync for message id=${messageId}`);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.debug({
+                local: 'messages.upsert.placeholder-received',
+                requestId,
+                received,
+              });
             }
 
             if (text == 'onDemandHistSync') {
               const messageId = await this.client.fetchMessageHistory(50, received.key, received.messageTimestamp!);
-              console.log('requested on-demand sync, id=', messageId);
+              this.logger.debug(`Requested on-demand sync for message id=${messageId}`);
             }
           }
 
@@ -2734,8 +2890,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
-          console.log(messageRaw);
-
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
           await chatbotController.emit({
@@ -2820,7 +2974,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
-      this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
+      this.logger.verbose({ local: 'messages.update', args });
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
@@ -2840,7 +2994,13 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
+        this.logger.debug({
+          local: 'messages.update.cache',
+          cached,
+          updateKey,
+          messageTimestamp: update.messageTimestamp,
+          secondsSinceEpoch,
+        });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -2908,9 +3068,10 @@ export class BaileysStartupService extends ChannelStartupService {
             findMessage = await this.findStoredMessageByKey(key as ExtendedIMessageKey, { searchId });
 
             if (!findMessage?.id) {
-              this.logger.verbose(
-                `Original message not found for update. Skipping. This is expected for protocol messages or ephemeral events not saved to the database. Key: ${JSON.stringify(key)}`,
-              );
+              this.logger.verbose({
+                local: 'messages.update.original-not-found',
+                key,
+              });
               continue;
             }
 
@@ -3459,7 +3620,7 @@ export class BaileysStartupService extends ChannelStartupService {
         },
       };
     } catch (error) {
-      this.logger.error(`Error generating link preview: ${error}`);
+      this.logger.warn({ local: 'linkPreview', error });
       return undefined;
     }
   }
@@ -4280,7 +4441,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return await sharp(imageBuffer).webp().toBuffer();
       }
     } catch (error) {
-      console.error('Erro ao converter a imagem para WebP:', error);
+      this.logger.error({ local: 'convertToWebP', error });
       throw error;
     }
   }
@@ -4424,7 +4585,7 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       ffmpegProcess.on('error', (error) => {
-        console.error('Error in ffmpeg process', error);
+        this.logger.error({ local: 'processAudioMp4.ffmpeg', error });
         reject(error);
       });
 
@@ -4443,7 +4604,7 @@ export class BaileysStartupService extends ChannelStartupService {
       inputStream.pipe(ffmpegProcess.stdin);
 
       inputStream.on('error', (err) => {
-        console.error('Error in inputStream', err);
+        this.logger.error({ local: 'processAudioMp4.inputStream', error: err });
         ffmpegProcess.stdin.end();
         reject(err);
       });
@@ -4504,7 +4665,7 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         outputAudioStream.on('error', (error) => {
-          console.log('error', error);
+          this.logger.error({ local: 'processAudio.outputStream', error });
           reject(error);
         });
 
@@ -4546,8 +4707,8 @@ export class BaileysStartupService extends ChannelStartupService {
             '0',
           ])
           .pipe(outputAudioStream, { end: true })
-          .on('error', function (error) {
-            console.log('error', error);
+          .on('error', (error) => {
+            this.logger.error({ local: 'processAudio.ffmpeg', error });
             reject(error);
           });
       });
@@ -4612,7 +4773,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (file?.buffer) {
       mediaData.audio = file.buffer.toString('base64');
     } else if (!isURL(data.audio) && !isBase64(data.audio)) {
-      console.error('Invalid file or audio source');
+      this.logger.warn('Invalid file or audio source');
       throw new BadRequestException('File buffer, URL, or base64 audio is required');
     }
 
@@ -5890,7 +6051,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
       if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
+        this.logger.debug(`Group metadata cache hit for ${groupJid}`);
         const meta = await groupMetadataCache.get(groupJid);
 
         if (Date.now() - meta.timestamp > 3600000) {
@@ -5900,7 +6061,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return meta.data;
       }
 
-      console.log(`Cache request for group: ${groupJid} - not found`);
+      this.logger.debug(`Group metadata cache miss for ${groupJid}`);
       return await this.updateGroupMetadataCache(groupJid);
     }
 
@@ -6191,7 +6352,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return { participants: parsedParticipants };
     } catch (error) {
-      console.error(error);
+      this.logger.error({ local: 'participants.find', error });
       throw new NotFoundException('No participants', error.toString());
     }
   }
@@ -6588,7 +6749,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSendNode(stanza: any) {
-    console.log('stanza', JSON.stringify(stanza));
+    this.logger.debug({ local: 'baileys.sendNode', stanza });
     const response = await this.client.sendNode(stanza);
 
     return response;
@@ -6672,7 +6833,7 @@ export class BaileysStartupService extends ChannelStartupService {
         catalog: productsCatalog,
       };
     } catch (error) {
-      console.log(error);
+      this.logger.warn({ local: 'fetchCatalog', error });
       return { wuid: jid, name: null, isBusiness: false };
     }
   }

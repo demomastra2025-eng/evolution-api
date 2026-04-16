@@ -157,7 +157,7 @@ export class EvolutionBotService extends BaseChatbotService<EvolutionBot, Evolut
       // Send telemetry
       sendTelemetry('/message/sendText');
     } catch (error) {
-      this.logger.error(`Error in sendMessageToBot: ${error.message || JSON.stringify(error)}`);
+      this.logger.error({ local: 'sendMessageToBot', error });
       return;
     }
   }

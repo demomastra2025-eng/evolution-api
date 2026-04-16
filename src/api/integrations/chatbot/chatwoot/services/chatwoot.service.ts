@@ -371,8 +371,7 @@ export class ChatwootService {
         }
       }
 
-      this.logger.error('Error creating contact');
-      console.log(error);
+      this.logger.error({ local: 'createContact', error });
       return null;
     }
   }
@@ -827,7 +826,7 @@ export class ChatwootService {
 
     try {
       this.logger.verbose(`--- Start createConversation ---`);
-      this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
+      this.logger.verbose({ local: 'createConversation.instance', instance });
 
       // If it already exists in the cache, return conversationId
       if (await this.cache.has(cacheKey)) {
@@ -902,7 +901,7 @@ export class ChatwootService {
           nameContact = `${group.subject} (GROUP)`;
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
-          this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
+          this.logger.verbose({ local: 'createConversation.participantProfilePicture', picture_url });
 
           const findParticipant = participantPhoneNumber
             ? await this.findContact(instance, participantPhoneNumber)
@@ -934,7 +933,7 @@ export class ChatwootService {
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
           isGroup ? chatId : conversationJid,
         );
-        this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
+        this.logger.verbose({ local: 'createConversation.contactProfilePicture', picture_url });
 
         this.logger.verbose(`Searching contact for: ${contactLookupKey}`);
         let contact = null;
@@ -1028,7 +1027,7 @@ export class ChatwootService {
               (conversation) =>
                 conversation && conversation.status !== 'resolved' && conversation.inbox_id == filterInbox.id,
             );
-            this.logger.verbose(`Found conversation: ${JSON.stringify(inboxConversation)}`);
+            this.logger.verbose({ local: 'createConversation.foundConversation', inboxConversation });
           }
 
           if (inboxConversation) {
@@ -1501,7 +1500,7 @@ export class ChatwootService {
   }
 
   public async onSendMessageError(instance: InstanceDto, conversation: number, error?: any) {
-    this.logger.verbose(`onSendMessageError ${JSON.stringify(error)}`);
+    this.logger.verbose({ local: 'onSendMessageError', error });
 
     const client = await this.clientCw(instance);
 
@@ -2396,7 +2395,7 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
+        this.logger.info({ local: `${event}.received`, body });
         if (body.key.remoteJid === 'status@broadcast') {
           return;
         }
@@ -2570,7 +2569,7 @@ export class ChatwootService {
 
         if (isInteractiveButtonMessage) {
           const buttons = body.message.interactiveMessage.nativeFlowMessage.buttons;
-          this.logger.info('is Interactive Button Message: ' + JSON.stringify(buttons));
+          this.logger.info({ local: 'interactiveButtons', buttons });
 
           for (const button of buttons) {
             const buttonParams = JSON.parse(button.buttonParamsJson);
