@@ -1161,7 +1161,21 @@ export class BaileysStartupService extends ChannelStartupService {
     this.reconnectTimeout = setTimeout(() => {
       this.reconnectTimeout = null;
 
-      void this.connectToWhatsapp(this.phoneNumber).catch((error) => {
+      const shouldForceReauthentication = !this.instance.wuid;
+
+      if (shouldForceReauthentication) {
+        this.logger.warn({
+          message: 'Reconnect requires fresh auth cycle for unauthenticated instance',
+          instanceName: this.instance.name,
+          number: this.phoneNumber ?? this.instance.number ?? null,
+        });
+      }
+
+      const reconnectAttempt = shouldForceReauthentication
+        ? this.forceReauthentication(this.phoneNumber)
+        : this.connectToWhatsapp(this.phoneNumber);
+
+      void reconnectAttempt.catch((error) => {
         this.logger.error({
           message: 'Scheduled reconnect failed',
           instanceName: this.instance.name,
@@ -1948,13 +1962,36 @@ export class BaileysStartupService extends ChannelStartupService {
       return this.connectInFlight;
     }
 
-    if (this.client && ['open', 'connecting', 'reconnecting'].includes(this.stateConnection.state)) {
+    if (this.client && ['open', 'connecting'].includes(this.stateConnection.state)) {
       this.logger.info({
         message: 'Instance already connected or connecting, skipping duplicate connect',
         instanceName: this.instance.name,
         state: this.stateConnection.state,
       });
       return this.client;
+    }
+
+    if (this.client && this.stateConnection.state === 'reconnecting') {
+      this.logger.warn({
+        message: 'Stale reconnect state detected, resetting socket before reconnect',
+        instanceName: this.instance.name,
+      });
+
+      try {
+        this.client.ws?.close();
+        this.client.end(new Error('Reconnect retry'));
+      } catch (error) {
+        this.logger.warn({
+          message: 'Failed to cleanup stale reconnect socket before reconnect',
+          instanceName: this.instance.name,
+          error: error?.toString?.() ?? String(error),
+        });
+      }
+
+      this.stateConnection = {
+        state: 'close',
+        statusReason: this.stateConnection.statusReason,
+      };
     }
 
     const connectPromise = (async () => {
