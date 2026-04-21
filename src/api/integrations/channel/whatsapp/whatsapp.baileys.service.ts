@@ -852,8 +852,8 @@ export class BaileysStartupService extends ChannelStartupService {
       remoteLid: resolution.remoteLid,
       pushName: this.pickPreferredName(
         (contact as any)?.verifiedName,
-        contact?.name,
         (contact as any)?.notify,
+        contact?.name,
         remoteJid.split('@')[0],
       ),
       profilePicUrl: null,
@@ -2348,9 +2348,9 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contact.id && (contact.notify || contact.name)) {
-            contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid });
+            contactsMap.set(contact.id, { name: contact.notify ?? contact.name, jid });
             if (jid && jid !== contact.id) {
-              contactsMap.set(jid, { name: contact.name ?? contact.notify, jid });
+              contactsMap.set(jid, { name: contact.notify ?? contact.name, jid });
             }
           }
 
