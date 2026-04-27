@@ -384,11 +384,19 @@ export class InstanceController {
       }
 
       if (state == 'connecting') {
+        if (this.hasAuthenticationArtifacts(instance)) {
+          return this.connectOutcomeResponse(instanceName, instance);
+        }
+
         await this.waitForConnectOutcome(instance);
         return this.connectOutcomeResponse(instanceName, instance);
       }
 
       if (state == 'close') {
+        if (this.hasAuthenticationArtifacts(instance)) {
+          return this.connectOutcomeResponse(instanceName, instance);
+        }
+
         instance.prepareForFreshConnectAttempt?.();
         await instance.connectToWhatsapp(number);
         await this.waitForConnectOutcome(instance);

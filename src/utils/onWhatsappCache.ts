@@ -200,8 +200,12 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
   }[] = [];
 
   if (configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
-    const remoteJidsWithoutPlus = remoteJids.flatMap((remoteJid) => getAvailableNumbers(remoteJid));
     const normalizedRemoteJids = normalizeJidOptions(remoteJids);
+    if (!normalizedRemoteJids.length) {
+      return results;
+    }
+
+    const remoteJidsWithoutPlus = normalizedRemoteJids.flatMap((remoteJid) => getAvailableNumbers(remoteJid));
     const lookupCandidates = getLookupCandidates(remoteJidsWithoutPlus);
 
     const onWhatsappCache = await prismaRepository.isOnWhatsapp.findMany({

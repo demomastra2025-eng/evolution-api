@@ -479,6 +479,52 @@ export class BaileysStartupService extends ChannelStartupService {
     return normalizedMappings;
   }
 
+  private async emitContactUpdatesForIdentityMappings(mappings: Array<{ lid: string; pn: string }>) {
+    if (!mappings.length) {
+      return;
+    }
+
+    const contactsRaw = (
+      await mapWithConcurrencyLimit(mappings, CONTACT_PROFILE_LOOKUP_CONCURRENCY, async ({ lid, pn }) => {
+        const normalizedContact = await this.normalizeContactPayload({
+          id: lid,
+          remoteJidAlt: pn,
+          remoteLid: lid,
+        } as Partial<Contact> & { id: string; remoteJidAlt: string; remoteLid: string });
+
+        if (!normalizedContact) {
+          return null;
+        }
+
+        return {
+          ...normalizedContact,
+          profilePicUrl: await this.resolveProfilePictureUrlForIdentity(normalizedContact),
+        };
+      })
+    ).filter(Boolean);
+
+    if (!contactsRaw.length) {
+      return;
+    }
+
+    this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      await eachWithConcurrencyLimit(contactsRaw, CONTACT_UPDATE_PERSISTENCE_CONCURRENCY, async (contact) => {
+        await this.chatwootService.reconcileContactIdentity(
+          { instanceName: this.instance.name, instanceId: this.instance.id },
+          {
+            remoteJid: contact.remoteJid,
+            remoteJidAlt: contact.remoteJidAlt,
+            remoteLid: contact.remoteLid,
+            pushName: contact.pushName,
+            profilePicUrl: contact.profilePicUrl,
+          },
+        );
+      });
+    }
+  }
+
   private buildMessageIdentityLookupKey(key: Partial<ExtendedIMessageKey> | undefined) {
     const id = key?.id;
 
@@ -1161,13 +1207,18 @@ export class BaileysStartupService extends ChannelStartupService {
     this.reconnectTimeout = setTimeout(() => {
       this.reconnectTimeout = null;
 
-      const shouldForceReauthentication = !this.instance.wuid;
+      const hasAuthArtifacts = this.hasAuthenticationArtifacts();
+      const shouldForceReauthentication = !this.instance.wuid && !hasAuthArtifacts;
 
       if (shouldForceReauthentication) {
         this.logger.warn({
           message: 'Reconnect requires fresh auth cycle for unauthenticated instance',
           instanceName: this.instance.name,
-          number: this.phoneNumber ?? this.instance.number ?? null,
+        });
+      } else if (!this.instance.wuid && hasAuthArtifacts) {
+        this.logger.info({
+          message: 'Keeping existing auth artifact during unauthenticated reconnect',
+          instanceName: this.instance.name,
         });
       }
 
@@ -1627,6 +1678,15 @@ export class BaileysStartupService extends ChannelStartupService {
       return this.initialConnectionRecoveryInFlight;
     }
 
+    if (this.hasAuthenticationArtifacts()) {
+      this.logger.info({
+        message: 'Initial connection recovery skipped because an auth artifact is already available',
+        instanceName: this.instance.name,
+        statusCode,
+      });
+      return true;
+    }
+
     if (this.initialConnectionRecoveryAttempted) {
       this.logger.warn({
         message: 'Initial connection recovery already attempted and QR is still missing',
@@ -1640,6 +1700,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.initialConnectionRecoveryInFlight = (async () => {
       try {
+        if (this.hasAuthenticationArtifacts()) {
+          return true;
+        }
+
         await this.forceReauthentication(this.phoneNumber ?? this.instance.number);
         return true;
       } catch (error) {
@@ -1972,7 +2036,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (this.client && this.stateConnection.state === 'reconnecting') {
-      this.logger.warn({
+      this.logger.info({
         message: 'Stale reconnect state detected, resetting socket before reconnect',
         instanceName: this.instance.name,
       });
@@ -3427,8 +3491,15 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['lid-mapping.update']) {
-              const payload = events['lid-mapping.update'] as { lid?: string | null; pn?: string | null };
-              await this.ingestIdentityMappings([payload], { reconcileDatabase: true, syncMessages: true });
+              const rawPayload = events['lid-mapping.update'] as
+                | { lid?: string | null; pn?: string | null }
+                | Array<{ lid?: string | null; pn?: string | null }>;
+              const payload = Array.isArray(rawPayload) ? rawPayload : [rawPayload];
+              const normalizedMappings = await this.ingestIdentityMappings(payload, {
+                reconcileDatabase: true,
+                syncMessages: true,
+              });
+              await this.emitContactUpdatesForIdentityMappings(normalizedMappings);
             }
 
             if (events['presence.update']) {
@@ -3657,7 +3728,7 @@ export class BaileysStartupService extends ChannelStartupService {
         },
       };
     } catch (error) {
-      this.logger.warn({ local: 'linkPreview', error });
+      this.logger.debug({ local: 'linkPreview', error });
       return undefined;
     }
   }
