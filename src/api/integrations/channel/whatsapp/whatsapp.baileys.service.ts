@@ -318,6 +318,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncLastProgress = -1;
   private initialConnectionRecoveryAttempted = false;
   private initialConnectionRecoveryInFlight: Promise<boolean> | null = null;
+  private scannedAuthenticationArtifactAt: number | null = null;
+  private readonly SCANNED_AUTHENTICATION_ARTIFACT_TTL_MS = 2 * 60 * 1000;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -1208,7 +1210,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.reconnectTimeout = null;
 
       const hasAuthArtifacts = this.hasAuthenticationArtifacts();
-      const shouldForceReauthentication = !this.instance.wuid && !hasAuthArtifacts;
+      const hasRecentlyScannedAuthArtifact = this.hasRecentlyScannedAuthenticationArtifact();
+      const shouldForceReauthentication = !this.instance.wuid && !hasAuthArtifacts && !hasRecentlyScannedAuthArtifact;
 
       if (shouldForceReauthentication) {
         this.logger.warn({
@@ -1218,6 +1221,11 @@ export class BaileysStartupService extends ChannelStartupService {
       } else if (!this.instance.wuid && hasAuthArtifacts) {
         this.logger.info({
           message: 'Keeping existing auth artifact during unauthenticated reconnect',
+          instanceName: this.instance.name,
+        });
+      } else if (!this.instance.wuid && hasRecentlyScannedAuthArtifact) {
+        this.logger.info({
+          message: 'Keeping recently scanned auth artifact during unauthenticated reconnect',
           instanceName: this.instance.name,
         });
       }
@@ -1267,6 +1275,18 @@ export class BaileysStartupService extends ChannelStartupService {
     return Boolean(this.instance.qrcode?.base64 || this.instance.qrcode?.code || this.instance.qrcode?.pairingCode);
   }
 
+  private hasRecentlyScannedAuthenticationArtifact(): boolean {
+    if (!this.scannedAuthenticationArtifactAt) {
+      return false;
+    }
+
+    return Date.now() - this.scannedAuthenticationArtifactAt <= this.SCANNED_AUTHENTICATION_ARTIFACT_TTL_MS;
+  }
+
+  private markAuthenticationArtifactScanned() {
+    this.scannedAuthenticationArtifactAt = Date.now();
+  }
+
   public prepareForFreshConnectAttempt() {
     this.initialConnectionRecoveryAttempted = false;
   }
@@ -1306,6 +1326,7 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.clearPersistedAuthState();
 
     this.instance.qrcode = { count: 0 };
+    this.scannedAuthenticationArtifactAt = null;
     this.instance.wuid = null;
     this.instance.profilePictureUrl = null;
     this.stateConnection = { state: 'close' };
@@ -1347,6 +1368,41 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  private async emitAuthenticationArtifactScannedUpdate() {
+    this.markAuthenticationArtifactScanned();
+
+    this.stateConnection = {
+      state: 'connecting',
+      statusReason: 200,
+    };
+
+    this.logger.info({
+      message: 'Authentication artifact consumed; waiting for WhatsApp open event',
+      instanceName: this.instance.name,
+    });
+
+    this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      instance: this.instance.name,
+      state: 'connecting',
+      status: 'connecting',
+      hasQr: false,
+      wuid: this.instance.wuid,
+    });
+
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.eventWhatsapp(
+        Events.CONNECTION_UPDATE,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        {
+          instance: this.instance.name,
+          state: 'connecting',
+          status: 'connecting',
+          hasQr: false,
+        },
+      );
+    }
+  }
+
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
@@ -1363,6 +1419,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (qr) {
       this.clearScheduledReconnect();
       this.initialConnectionRecoveryAttempted = false;
+      this.scannedAuthenticationArtifactAt = null;
 
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -1445,6 +1502,10 @@ export class BaileysStartupService extends ChannelStartupService {
       if (!persisted) {
         return;
       }
+    }
+
+    if (!qr && !connection && !this.instance.wuid && (this.instance.qrcode?.count ?? 0) > 0) {
+      await this.emitAuthenticationArtifactScannedUpdate();
     }
 
     if (connection) {
@@ -1563,6 +1624,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'open') {
       this.clearScheduledReconnect();
       this.initialConnectionRecoveryAttempted = false;
+      this.scannedAuthenticationArtifactAt = null;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);

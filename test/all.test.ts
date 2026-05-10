@@ -40,6 +40,37 @@ assert.match(
   /shouldForceReauthentication\s*=\s*!this\.instance\.wuid\s*&&\s*!has/,
   'scheduled reconnect must keep fresh QR/pairing artifacts stable while wuid is still empty'
 );
+assert.match(
+  scheduleReconnectBlock,
+  /hasRecentlyScannedAuthenticationArtifact\(\)/,
+  'scheduled reconnect must also keep a just-scanned QR stable even after Baileys clears QR fields'
+);
+assert.match(
+  scheduleReconnectBlock,
+  /!hasRecentlyScannedAuthArtifact/,
+  'scheduled reconnect must not force reauthentication while a scanned QR is still completing'
+);
+
+const qrConsumedBlock = extractBlock(
+  baileysService,
+  'private async emitAuthenticationArtifactScannedUpdate()',
+  'private async connectionUpdate'
+);
+assert.match(
+  qrConsumedBlock,
+  /Events\.CONNECTION_UPDATE/,
+  'QR-consumed updates must be forwarded to webhooks so Chatwoot can enter qr_scanned'
+);
+assert.match(
+  qrConsumedBlock,
+  /hasQr:\s*false/,
+  'QR-consumed webhook must include hasQr:false'
+);
+assert.match(
+  qrConsumedBlock,
+  /state:\s*'connecting'/,
+  'QR-consumed webhook must keep the instance in connecting state, not reauth_required'
+);
 
 const connectToWhatsappBlock = extractBlock(
   instanceController,
