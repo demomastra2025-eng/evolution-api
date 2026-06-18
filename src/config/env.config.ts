@@ -331,6 +331,11 @@ export type Chatwoot = {
       CONNECTION: {
         URI: string;
       };
+      POOL: {
+        MAX: number;
+        IDLE_TIMEOUT_MS: number;
+        CONNECTION_TIMEOUT_MS: number;
+      };
     };
     PLACEHOLDER_MEDIA_MESSAGE: boolean;
   };
@@ -835,6 +840,12 @@ export class ConfigService {
           DATABASE: {
             CONNECTION: {
               URI: process.env.CHATWOOT_IMPORT_DATABASE_CONNECTION_URI || '',
+            },
+            POOL: {
+              MAX: Number.parseInt(process.env.CHATWOOT_IMPORT_DATABASE_POOL_MAX) || 4,
+              IDLE_TIMEOUT_MS: Number.parseInt(process.env.CHATWOOT_IMPORT_DATABASE_IDLE_TIMEOUT_MS) || 30000,
+              CONNECTION_TIMEOUT_MS:
+                Number.parseInt(process.env.CHATWOOT_IMPORT_DATABASE_CONNECTION_TIMEOUT_MS) || 5000,
             },
           },
           PLACEHOLDER_MEDIA_MESSAGE: process.env?.CHATWOOT_IMPORT_PLACEHOLDER_MEDIA_MESSAGE === 'true',

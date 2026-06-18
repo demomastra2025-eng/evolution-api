@@ -38,9 +38,29 @@ class Postgres {
   }
 
   getChatwootConnection() {
-    const uri = configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI;
+    const databaseConfig = configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE;
+    const uri = databaseConfig.CONNECTION.URI;
 
-    return this.getConnection(uri);
+    if (!this.connected) {
+      this.pool = new Pool({
+        connectionString: uri,
+        max: databaseConfig.POOL.MAX,
+        idleTimeoutMillis: databaseConfig.POOL.IDLE_TIMEOUT_MS,
+        connectionTimeoutMillis: databaseConfig.POOL.CONNECTION_TIMEOUT_MS,
+        ssl: {
+          rejectUnauthorized: false,
+        },
+      });
+
+      this.pool.on('error', () => {
+        this.logger.error('postgres disconnected');
+        this.connected = false;
+      });
+
+      this.connected = true;
+    }
+
+    return this.pool;
   }
 }
 
