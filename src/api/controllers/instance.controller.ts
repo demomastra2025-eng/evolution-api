@@ -407,7 +407,7 @@ export class InstanceController {
       return this.connectOutcomeResponse(instanceName, instance);
     } catch (error) {
       this.logger.error(error);
-      return { error: true, message: error.toString() };
+      return { error: true, message: this.errorMessage(error) };
     }
   }
 
@@ -497,6 +497,23 @@ export class InstanceController {
     }
 
     return Boolean(instance.qrCode?.base64 || instance.qrCode?.code || instance.qrCode?.pairingCode);
+  }
+
+  private errorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    if (typeof error === 'string') {
+      return error;
+    }
+
+    try {
+      const serialized = JSON.stringify(error);
+      return serialized && serialized !== '{}' ? serialized : String(error);
+    } catch {
+      return String(error);
+    }
   }
 
   private async waitForConnectOutcome(

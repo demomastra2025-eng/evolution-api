@@ -72,6 +72,43 @@ assert.match(
   'QR-consumed webhook must keep the instance in connecting state, not reauth_required'
 );
 
+const pairingCodeHelperBlock = extractBlock(
+  baileysService,
+  'private async requestPairingCodeForCurrentQr()',
+  'private async emitAuthenticationArtifactScannedUpdate()'
+);
+assert.match(
+  pairingCodeHelperBlock,
+  /try\s*{/,
+  'pairing-code generation must be isolated so failures do not prevent QR generation'
+);
+assert.match(
+  pairingCodeHelperBlock,
+  /catch \(error\)/,
+  'pairing-code generation failures must be caught and logged'
+);
+assert.match(
+  pairingCodeHelperBlock,
+  /return null;/,
+  'failed pairing-code generation must fall back to a QR-only authorization artifact'
+);
+
+const qrUpdateBlock = extractBlock(
+  baileysService,
+  'if (qr) {',
+  'if (!qr && !connection'
+);
+assert.match(
+  qrUpdateBlock,
+  /this\.instance\.qrcode\.pairingCode\s*=\s*await this\.requestPairingCodeForCurrentQr\(\);/,
+  'QR generation must use the safe pairing-code helper'
+);
+assert.match(
+  qrUpdateBlock,
+  /this\.sendDataWebhook\(Events\.QRCODE_UPDATED/,
+  'QR generation must still emit qrcode.updated after the safe pairing-code attempt'
+);
+
 const connectToWhatsappBlock = extractBlock(
   instanceController,
   'public async connectToWhatsapp',

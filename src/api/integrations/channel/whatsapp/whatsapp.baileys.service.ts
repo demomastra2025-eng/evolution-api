@@ -1368,6 +1368,41 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
+  private errorMessage(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    if (typeof error === 'string') {
+      return error;
+    }
+
+    try {
+      const serialized = JSON.stringify(error);
+      return serialized && serialized !== '{}' ? serialized : String(error);
+    } catch {
+      return String(error);
+    }
+  }
+
+  private async requestPairingCodeForCurrentQr(): Promise<string | null> {
+    if (!this.phoneNumber) {
+      return null;
+    }
+
+    try {
+      await delay(1000);
+      return await this.client.requestPairingCode(this.phoneNumber);
+    } catch (error) {
+      this.logger.warn({
+        message: 'Pairing code request failed; continuing with QR authorization artifact',
+        instanceName: this.instance.name,
+        error: this.errorMessage(error),
+      });
+      return null;
+    }
+  }
+
   private async emitAuthenticationArtifactScannedUpdate() {
     this.markAuthenticationArtifactScanned();
 
@@ -1460,12 +1495,7 @@ export class BaileysStartupService extends ChannelStartupService {
         color: { light: '#ffffff', dark: color },
       };
 
-      if (this.phoneNumber) {
-        await delay(1000);
-        this.instance.qrcode.pairingCode = await this.client.requestPairingCode(this.phoneNumber);
-      } else {
-        this.instance.qrcode.pairingCode = null;
-      }
+      this.instance.qrcode.pairingCode = await this.requestPairingCodeForCurrentQr();
 
       qrcode.toDataURL(qr, optsQrcode, (error, base64) => {
         if (error) {
