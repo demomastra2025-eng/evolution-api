@@ -108,6 +108,10 @@ assert.match(
   /this\.sendDataWebhook\(Events\.QRCODE_UPDATED/,
   'QR generation must still emit qrcode.updated after the safe pairing-code attempt'
 );
+assert.ok(
+  !baileysService.includes('qrcode-terminal') && !baileysService.includes('qrcodeTerminal.generate'),
+  'QR authorization artifacts must not be rendered into production logs'
+);
 
 const connectToWhatsappBlock = extractBlock(
   instanceController,

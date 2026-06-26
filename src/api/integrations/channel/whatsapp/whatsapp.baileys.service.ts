@@ -147,7 +147,6 @@ import cron from 'node-cron';
 import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
-import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
@@ -1521,11 +1520,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       });
 
-      qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
-        this.logger.log(
-          `\n{ instance: ${this.instance.name} pairingCode: ${this.instance.qrcode.pairingCode}, qrcodeCount: ${this.instance.qrcode.count} }\n` +
-            qrcode,
-        ),
+      this.logger.log(
+        `WhatsApp Web QR authorization artifact generated for instance ${this.instance.name} (qrcodeCount: ${this.instance.qrcode.count})`,
       );
 
       const persisted = await this.updateInstanceRecord({ connectionStatus: 'connecting' }, 'qrcode.connecting');
