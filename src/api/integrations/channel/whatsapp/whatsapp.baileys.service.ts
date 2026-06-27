@@ -1286,8 +1286,32 @@ export class BaileysStartupService extends ChannelStartupService {
     this.scannedAuthenticationArtifactAt = Date.now();
   }
 
+  private shouldResetEndedUnauthenticatedSession(): boolean {
+    return this.endSession && !this.isDeleting && !this.instance.wuid;
+  }
+
+  private resetEndedUnauthenticatedSessionForFreshConnect() {
+    this.logger.info({
+      message: 'Resetting ended unauthenticated session for a fresh WhatsApp auth cycle',
+      instanceName: this.instance.name,
+    });
+
+    this.endSession = false;
+    this.clearScheduledReconnect();
+    this.instance.qrcode = { count: 0 };
+    this.scannedAuthenticationArtifactAt = null;
+    this.stateConnection = {
+      state: 'close',
+      statusReason: this.stateConnection.statusReason,
+    };
+  }
+
   public prepareForFreshConnectAttempt() {
     this.initialConnectionRecoveryAttempted = false;
+
+    if (this.shouldResetEndedUnauthenticatedSession()) {
+      this.resetEndedUnauthenticatedSessionForFreshConnect();
+    }
   }
 
   public async forceReauthentication(number?: string): Promise<WASocket> {
@@ -2100,6 +2124,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.shouldResetEndedUnauthenticatedSession()) {
+      this.resetEndedUnauthenticatedSessionForFreshConnect();
+    }
+
     if (this.isDeleting || this.endSession) {
       throw new BadRequestException(`The "${this.instance.name}" instance is being deleted`);
     }

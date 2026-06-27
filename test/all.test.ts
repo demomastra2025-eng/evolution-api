@@ -130,4 +130,41 @@ assert.match(
   '/instance/connect must not start a fresh socket when a close-state instance still has an auth artifact'
 );
 
+const prepareFreshConnectBlock = extractBlock(
+  baileysService,
+  'public prepareForFreshConnectAttempt()',
+  'public async forceReauthentication'
+);
+assert.match(
+  prepareFreshConnectBlock,
+  /this\.shouldResetEndedUnauthenticatedSession\(\)/,
+  'fresh connect attempts must reset ended unauthenticated QR-limit sessions'
+);
+assert.match(
+  prepareFreshConnectBlock,
+  /this\.resetEndedUnauthenticatedSessionForFreshConnect\(\)/,
+  'fresh connect attempts must clear QR-limit endSession before reconnecting'
+);
+
+const connectToWhatsappRuntimeBlock = extractBlock(
+  baileysService,
+  'public async connectToWhatsapp(number?: string)',
+  'public async reloadConnection'
+);
+assert.match(
+  connectToWhatsappRuntimeBlock,
+  /this\.shouldResetEndedUnauthenticatedSession\(\)/,
+  'connectToWhatsapp must not leave QR-limit endSession stuck behind the generic deleting guard'
+);
+assert.match(
+  connectToWhatsappRuntimeBlock,
+  /this\.resetEndedUnauthenticatedSessionForFreshConnect\(\)/,
+  'connectToWhatsapp must reset ended unauthenticated sessions before checking the deleting guard'
+);
+assert.match(
+  baileysService,
+  /return this\.endSession && !this\.isDeleting && !this\.instance\.wuid;/,
+  'only non-deleting unauthenticated ended sessions may be reset for a new QR cycle'
+);
+
 console.log('WhatsApp auth lifecycle regression checks passed');
