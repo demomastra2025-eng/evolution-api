@@ -222,6 +222,11 @@ assert.match(baileysService, /if \(this\.reauthenticationInFlight\) \{/);
 assert.match(instanceController, /this\.runtimeConnectionState\(runtimeInstance\)/);
 assert.match(baileysService, /public async hasPersistedAuthenticationCredentials\(\)/);
 assert.match(instanceController, /hasPersistedAuthenticationCredentials/);
+assert.match(
+  baileysService,
+  /Object\.assign\(eventAuthState\.state\.creds, events\['creds\.update'\]\);\s*await eventAuthState\.saveCreds\(\)/,
+  'credential updates must be merged into the persisted auth state before saveCreds'
+);
 assert.match(baileysService, /await eventAuthState\.saveCreds\(\)/);
 assert.match(baileysService, /if \(eventClient !== this\.client\) \{\s*return;/s);
 assert.match(baileysService, /public async hasDurableLiveConnection\(\)/);

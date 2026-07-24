@@ -3798,6 +3798,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['creds.update']) {
+              Object.assign(eventAuthState.state.creds, events['creds.update']);
               await eventAuthState.saveCreds();
               if (eventClient !== this.client) {
                 return;
