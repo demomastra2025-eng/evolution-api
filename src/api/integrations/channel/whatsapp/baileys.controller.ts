@@ -10,6 +10,12 @@ export class BaileysController {
     return instance.baileysOnWhatsapp(body?.jid);
   }
 
+  public async generateMessageID({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
+    return instance.generateMessageID();
+  }
+
   public async profilePictureUrl({ instanceName }: InstanceDto, body: any) {
     const instance = this.waMonitor.waInstances[instanceName];
 

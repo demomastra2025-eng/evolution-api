@@ -9,7 +9,7 @@ import { TypebotService } from '@api/integrations/chatbot/typebot/services/typeb
 import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { eventManager, waMonitor } from '@api/server.module';
 import { Events, wa } from '@api/types/wa.types';
-import { Auth, Chatwoot, ConfigService, HttpServer, Proxy } from '@config/env.config';
+import { Auth, Chatwoot, ConfigService, Database, HttpServer, Proxy } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
@@ -27,7 +27,7 @@ export class ChannelStartupService {
     public readonly eventEmitter: EventEmitter2,
     public readonly prismaRepository: PrismaRepository,
     public readonly chatwootCache: CacheService,
-  ) { }
+  ) {}
 
   public readonly logger = new Logger('ChannelStartupService');
 
@@ -60,6 +60,7 @@ export class ChannelStartupService {
     this.instance.number = instance.number;
     this.instance.token = instance.token;
     this.instance.businessId = instance.businessId;
+    this.instance.ownerJid = instance.ownerJid;
 
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       this.chatwootService.eventWhatsapp(
@@ -431,7 +432,13 @@ export class ChannelStartupService {
     return data;
   }
 
-  public async sendDataWebhook<T extends object = any>(event: Events, data: T, local = true, integration?: string[]) {
+  public async sendDataWebhook<T extends object = any>(
+    event: Events,
+    data: T,
+    local = true,
+    integration?: string[],
+    extra?: Record<string, any>,
+  ) {
     const serverUrl = this.configService.get<HttpServer>('SERVER').URL;
     const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
     const localISOTime = new Date(Date.now() - tzoffset).toISOString();
@@ -452,6 +459,7 @@ export class ChannelStartupService {
       apiKey: expose && instanceApikey ? instanceApikey : null,
       local,
       integration,
+      extra,
     });
   }
 
@@ -490,18 +498,21 @@ export class ChannelStartupService {
   }
 
   public async fetchContacts(query: Query<Contact>) {
-    const remoteJid = query?.where?.remoteJid
-      ? query?.where?.remoteJid.includes('@')
-        ? query.where?.remoteJid
-        : createJid(query.where?.remoteJid)
-      : null;
-
-    const where = {
+    const where: any = {
       instanceId: this.instanceId,
     };
 
-    if (remoteJid) {
+    if (query?.where?.remoteJid) {
+      const remoteJid = query.where.remoteJid.includes('@') ? query.where.remoteJid : createJid(query.where.remoteJid);
       where['remoteJid'] = remoteJid;
+    }
+
+    if (query?.where?.id) {
+      where['id'] = query.where.id;
+    }
+
+    if (query?.where?.pushName) {
+      where['pushName'] = query.where.pushName;
     }
 
     const contactFindManyArgs: Prisma.ContactFindManyArgs = {
@@ -532,14 +543,12 @@ export class ChannelStartupService {
 
   public cleanMessageData(message: any) {
     if (!message) return message;
-
     const cleanedMessage = { ...message };
 
-    const mediaUrl = cleanedMessage.message.mediaUrl;
-
-    delete cleanedMessage.message.base64;
-
     if (cleanedMessage.message) {
+      const { mediaUrl } = cleanedMessage.message;
+      delete cleanedMessage.message.base64;
+
       // Limpa imageMessage
       if (cleanedMessage.message.imageMessage) {
         cleanedMessage.message.imageMessage = {
@@ -581,9 +590,9 @@ export class ChannelStartupService {
           name: cleanedMessage.message.documentWithCaptionMessage.name,
         };
       }
-    }
 
-    if (mediaUrl) cleanedMessage.message.mediaUrl = mediaUrl;
+      if (mediaUrl) cleanedMessage.message.mediaUrl = mediaUrl;
+    }
 
     return cleanedMessage;
   }
@@ -722,81 +731,147 @@ export class ChannelStartupService {
       where['remoteJid'] = remoteJid;
     }
 
-    const timestampFilter =
-      query?.where?.messageTimestamp?.gte && query?.where?.messageTimestamp?.lte
-        ? Prisma.sql`
-        AND "Message"."messageTimestamp" >= ${Math.floor(new Date(query.where.messageTimestamp.gte).getTime() / 1000)}
-        AND "Message"."messageTimestamp" <= ${Math.floor(new Date(query.where.messageTimestamp.lte).getTime() / 1000)}`
-        : Prisma.sql``;
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    const take = query?.offset ? Number(query.offset) : null;
+    const skip = query?.page ? Number(query.offset) * (Math.max(Number(query.page), 1) - 1) : null;
+    const limit = take ? Prisma.sql`LIMIT ${take}` : Prisma.sql``;
+    const offset = skip ? Prisma.sql`OFFSET ${skip}` : Prisma.sql``;
 
-    const limit = query?.take ? Prisma.sql`LIMIT ${query.take}` : Prisma.sql``;
-    const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
+    let results: any[];
 
-    const results = await this.prismaRepository.$queryRaw`
-      WITH rankedMessages AS (
-        SELECT DISTINCT ON ("Message"."key"->>'remoteJid') 
-          "Contact"."id" as "contactId",
-          "Message"."key"->>'remoteJid' as "remoteJid",
-          CASE 
-            WHEN "Message"."key"->>'remoteJid' LIKE '%@g.us' THEN COALESCE("Chat"."name", "Contact"."pushName")
-            ELSE COALESCE("Contact"."pushName", "Message"."pushName")
-          END as "pushName",
-          "Contact"."profilePicUrl",
-          COALESCE(
-            to_timestamp("Message"."messageTimestamp"::double precision), 
-            "Contact"."updatedAt"
-          ) as "updatedAt",
-          "Chat"."name" as "pushName",
-          "Chat"."createdAt" as "windowStart",
-          "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
-          "Chat"."unreadMessages" as "unreadMessages",
-          CASE WHEN "Chat"."createdAt" + INTERVAL '24 hours' > NOW() THEN true ELSE false END as "windowActive",
-          "Message"."id" AS "lastMessageId",
-          "Message"."key" AS "lastMessage_key",
+    if (provider === 'mysql') {
+      // MySQL version
+      const timestampFilterMysql =
+        query?.where?.messageTimestamp?.gte && query?.where?.messageTimestamp?.lte
+          ? Prisma.sql`
+          AND Message.messageTimestamp >= ${Math.floor(new Date(query.where.messageTimestamp.gte).getTime() / 1000)}
+          AND Message.messageTimestamp <= ${Math.floor(new Date(query.where.messageTimestamp.lte).getTime() / 1000)}`
+          : Prisma.sql``;
+
+      results = await this.prismaRepository.$queryRaw`
+        SELECT
+          Contact.id as contactId,
+          JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid')) as remoteJid,
           CASE
-            WHEN "Message"."key"->>'fromMe' = 'true' THEN 'Вы'
-            ELSE "Message"."pushName"
-          END AS "lastMessagePushName",
-          "Message"."participant" AS "lastMessageParticipant",
-          "Message"."messageType" AS "lastMessageMessageType",
-          "Message"."message" AS "lastMessageMessage",
-          "Message"."contextInfo" AS "lastMessageContextInfo",
-          "Message"."source" AS "lastMessageSource",
-          "Message"."messageTimestamp" AS "lastMessageMessageTimestamp",
-          "Message"."instanceId" AS "lastMessageInstanceId",
-          "Message"."sessionId" AS "lastMessageSessionId",
-          "Message"."status" AS "lastMessageStatus"
-        FROM "Message"
-        LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
-        LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
-        WHERE "Message"."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
-        ${timestampFilter}
-        ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
-      )
-      SELECT * FROM rankedMessages 
-      ORDER BY "updatedAt" DESC NULLS LAST
-      ${limit}
-      ${offset};
-    `;
+            WHEN JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid')) LIKE '%@g.us' THEN COALESCE(Chat.name, Contact.pushName)
+            ELSE COALESCE(Contact.pushName, Message.pushName)
+          END as pushName,
+          Contact.profilePicUrl,
+          COALESCE(
+            FROM_UNIXTIME(Message.messageTimestamp),
+            Contact.updatedAt
+          ) as updatedAt,
+          Chat.name as chatName,
+          Chat.createdAt as windowStart,
+          DATE_ADD(Chat.createdAt, INTERVAL 24 HOUR) as windowExpires,
+          Chat.unreadMessages as unreadMessages,
+          CASE WHEN DATE_ADD(Chat.createdAt, INTERVAL 24 HOUR) > NOW() THEN 1 ELSE 0 END as windowActive,
+          Message.id AS lastMessageId,
+          Message.key AS lastMessage_key,
+          CASE
+            WHEN JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.fromMe')) = 'true' THEN 'Você'
+            ELSE Message.pushName
+          END AS lastMessagePushName,
+          Message.participant AS lastMessageParticipant,
+          Message.messageType AS lastMessageMessageType,
+          Message.message AS lastMessageMessage,
+          Message.contextInfo AS lastMessageContextInfo,
+          Message.source AS lastMessageSource,
+          Message.messageTimestamp AS lastMessageMessageTimestamp,
+          Message.instanceId AS lastMessageInstanceId,
+          Message.sessionId AS lastMessageSessionId,
+          Message.status AS lastMessageStatus
+        FROM Message
+        LEFT JOIN Contact ON Contact.remoteJid = JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid')) AND Contact.instanceId = Message.instanceId
+        LEFT JOIN Chat ON Chat.remoteJid = JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid')) AND Chat.instanceId = Message.instanceId
+        WHERE Message.instanceId = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid')) = ${remoteJid}` : Prisma.sql``}
+        ${timestampFilterMysql}
+        AND Message.messageTimestamp = (
+          SELECT MAX(m2.messageTimestamp)
+          FROM Message m2
+          WHERE JSON_UNQUOTE(JSON_EXTRACT(m2.key, '$.remoteJid')) = JSON_UNQUOTE(JSON_EXTRACT(Message.key, '$.remoteJid'))
+          AND m2.instanceId = Message.instanceId
+        )
+        ORDER BY updatedAt DESC
+        ${limit}
+        ${offset};
+      `;
+    } else {
+      // PostgreSQL version
+      const timestampFilter =
+        query?.where?.messageTimestamp?.gte && query?.where?.messageTimestamp?.lte
+          ? Prisma.sql`
+          AND "Message"."messageTimestamp" >= ${Math.floor(new Date(query.where.messageTimestamp.gte).getTime() / 1000)}
+          AND "Message"."messageTimestamp" <= ${Math.floor(new Date(query.where.messageTimestamp.lte).getTime() / 1000)}`
+          : Prisma.sql``;
+
+      results = await this.prismaRepository.$queryRaw`
+        WITH rankedMessages AS (
+          SELECT DISTINCT ON ("Message"."key"->>'remoteJid')
+            "Contact"."id" as "contactId",
+            "Message"."key"->>'remoteJid' as "remoteJid",
+            CASE
+              WHEN "Message"."key"->>'remoteJid' LIKE '%@g.us' THEN COALESCE("Chat"."name", "Contact"."pushName")
+              ELSE COALESCE("Contact"."pushName", "Message"."pushName")
+            END as "pushName",
+            "Contact"."profilePicUrl",
+            COALESCE(
+              to_timestamp("Message"."messageTimestamp"::double precision),
+              "Contact"."updatedAt"
+            ) as "updatedAt",
+            "Chat"."name" as "pushName",
+            "Chat"."createdAt" as "windowStart",
+            "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
+            "Chat"."unreadMessages" as "unreadMessages",
+            CASE WHEN "Chat"."createdAt" + INTERVAL '24 hours' > NOW() THEN true ELSE false END as "windowActive",
+            "Message"."id" AS "lastMessageId",
+            "Message"."key" AS "lastMessage_key",
+            CASE
+              WHEN "Message"."key"->>'fromMe' = 'true' THEN 'Você'
+              ELSE "Message"."pushName"
+            END AS "lastMessagePushName",
+            "Message"."participant" AS "lastMessageParticipant",
+            "Message"."messageType" AS "lastMessageMessageType",
+            "Message"."message" AS "lastMessageMessage",
+            "Message"."contextInfo" AS "lastMessageContextInfo",
+            "Message"."source" AS "lastMessageSource",
+            "Message"."messageTimestamp" AS "lastMessageMessageTimestamp",
+            "Message"."instanceId" AS "lastMessageInstanceId",
+            "Message"."sessionId" AS "lastMessageSessionId",
+            "Message"."status" AS "lastMessageStatus"
+          FROM "Message"
+          LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
+          LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
+          WHERE "Message"."instanceId" = ${this.instanceId}
+          ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+          ${timestampFilter}
+          ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
+        )
+        SELECT * FROM rankedMessages
+        ORDER BY "updatedAt" DESC NULLS LAST
+        ${limit}
+        ${offset};
+      `;
+    }
 
     if (results && isArray(results) && results.length > 0) {
       const mappedResults = results.map((contact) => {
         const lastMessage = contact.lastMessageId
           ? {
-            id: contact.lastMessageId,
-            key: contact.lastMessage_key,
-            pushName: contact.lastMessagePushName,
-            participant: contact.lastMessageParticipant,
-            messageType: contact.lastMessageMessageType,
-            message: contact.lastMessageMessage,
-            contextInfo: contact.lastMessageContextInfo,
-            source: contact.lastMessageSource,
-            messageTimestamp: contact.lastMessageMessageTimestamp,
-            instanceId: contact.lastMessageInstanceId,
-            sessionId: contact.lastMessageSessionId,
-            status: contact.lastMessageStatus,
-          }
+              id: contact.lastMessageId,
+              key: contact.lastMessage_key,
+              pushName: contact.lastMessagePushName,
+              participant: contact.lastMessageParticipant,
+              messageType: contact.lastMessageMessageType,
+              message: contact.lastMessageMessage,
+              contextInfo: contact.lastMessageContextInfo,
+              source: contact.lastMessageSource,
+              messageTimestamp: contact.lastMessageMessageTimestamp,
+              instanceId: contact.lastMessageInstanceId,
+              sessionId: contact.lastMessageSessionId,
+              status: contact.lastMessageStatus,
+            }
           : undefined;
 
         return {

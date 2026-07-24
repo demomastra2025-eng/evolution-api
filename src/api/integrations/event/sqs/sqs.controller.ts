@@ -79,7 +79,7 @@ export class SqsController extends EventController implements EventControllerInt
       },
     };
 
-    console.log('*** payload: ', payload);
+    this.logger.debug({ local: 'set', payload });
     return this.prisma[this.name].upsert(payload);
   }
 
@@ -93,6 +93,7 @@ export class SqsController extends EventController implements EventControllerInt
     sender,
     apiKey,
     integration,
+    extra,
   }: EmitData): Promise<void> {
     if (integration && !integration.includes('sqs')) {
       return;
@@ -125,9 +126,12 @@ export class SqsController extends EventController implements EventControllerInt
             ? 'singlequeue'
             : `${event.replace('.', '_').toLowerCase()}`;
         const queueName = `${prefixName}_${eventFormatted}.fifo`;
-        const sqsUrl = `https://sqs.${sqsConfig.REGION}.amazonaws.com/${sqsConfig.ACCOUNT_ID}/${queueName}`;
+        const rawBaseUrl = sqsConfig.BASE_URL || `https://sqs.${sqsConfig.REGION}.amazonaws.com`;
+        const baseUrl = rawBaseUrl.replace(/\/+$/, '');
+        const sqsUrl = `${baseUrl}/${sqsConfig.ACCOUNT_ID}/${queueName}`;
 
         const message = {
+          ...(extra ?? {}),
           event,
           instance: instanceName,
           dataType: 'json',
@@ -207,7 +211,7 @@ export class SqsController extends EventController implements EventControllerInt
     if (enable) {
       const sqsConfig = configService.get<Sqs>('SQS');
       const eventsFinded = await this.listQueues(prefixName);
-      console.log('eventsFinded', eventsFinded);
+      this.logger.debug({ local: 'saveQueues', prefixName, eventsFinded });
 
       for (const event of events) {
         const normalizedEvent =

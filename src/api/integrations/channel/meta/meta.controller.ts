@@ -22,7 +22,7 @@ export class MetaController extends ChannelController implements ChannelControll
         });
 
         if (!template) {
-          console.log('template not found');
+          this.logger.warn('template not found');
           return;
         }
 

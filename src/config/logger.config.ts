@@ -1,3 +1,4 @@
+import { formatLogValue, sanitizeLogValue } from '@utils/log-sanitizer';
 import dayjs from 'dayjs';
 import fs from 'fs';
 
@@ -80,6 +81,7 @@ export class Logger {
     this.configService.get<Log>('LOG').LEVEL.forEach((level) => types.push(Type[level]));
 
     const typeValue = typeof value;
+    const renderedValue = formatLogValue(sanitizeLogValue(value));
     if (types.includes(type)) {
       if (configService.get<Log>('LOG').COLOR) {
         console.log(
@@ -104,10 +106,9 @@ export class Logger {
           Color[type] + Command.BRIGHT,
           `[${typeValue}]` + Command.RESET,
           Color[type],
-          typeValue !== 'object' ? value : '',
+          renderedValue,
           Command.RESET,
         );
-        typeValue === 'object' ? console.log(/*Level.DARK,*/ value, '\n') : '';
       } else {
         console.log(
           '[Evolution API]',
@@ -118,7 +119,7 @@ export class Logger {
           `${type} `,
           `[${this.context}]`,
           `[${typeValue}]`,
-          value,
+          renderedValue,
         );
       }
     }

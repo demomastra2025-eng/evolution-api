@@ -161,7 +161,7 @@ export class EvoaiService extends BaseChatbotService<Evoai, EvoaiSetting> {
           return part;
         });
       }
-      this.logger.debug(`[EvoAI] Payload: ${JSON.stringify(redactedPayload)}`);
+      this.logger.debug({ local: 'payload', redactedPayload });
 
       if (instance.integration === Integration.WHATSAPP_BAILEYS) {
         await instance.client.presenceSubscribe(remoteJid);
@@ -175,7 +175,7 @@ export class EvoaiService extends BaseChatbotService<Evoai, EvoaiSetting> {
         },
       });
 
-      this.logger.debug(`[EvoAI] Response: ${JSON.stringify(response.data)}`);
+      this.logger.debug({ local: 'response', data: response.data });
 
       if (instance.integration === Integration.WHATSAPP_BAILEYS)
         await instance.client.sendPresenceUpdate('paused', remoteJid);

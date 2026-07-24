@@ -318,7 +318,7 @@ export class EvolutionStartupService extends ChannelStartupService {
 
       let audioFile;
 
-      const messageId = v4();
+      const messageId = options?.messageId ?? v4();
 
       let messageRaw: any;
 
@@ -548,6 +548,7 @@ export class EvolutionStartupService extends ChannelStartupService {
         linkPreview: data?.linkPreview,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
       },
       null,
       isIntegration,
@@ -613,6 +614,7 @@ export class EvolutionStartupService extends ChannelStartupService {
         linkPreview: data?.linkPreview,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
       },
       file,
       isIntegration,
@@ -695,7 +697,7 @@ export class EvolutionStartupService extends ChannelStartupService {
     if (file?.buffer) {
       mediaData.audio = file.buffer.toString('base64');
     } else {
-      console.error('El archivo o buffer no est� definido correctamente.');
+      this.logger.warn('File or buffer is not defined correctly');
       throw new Error('File or buffer is undefined.');
     }
 
@@ -711,6 +713,7 @@ export class EvolutionStartupService extends ChannelStartupService {
         linkPreview: data?.linkPreview,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
       },
       file,
       isIntegration,
@@ -736,6 +739,7 @@ export class EvolutionStartupService extends ChannelStartupService {
         quoted: data?.quoted,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
       },
       null,
       isIntegration,

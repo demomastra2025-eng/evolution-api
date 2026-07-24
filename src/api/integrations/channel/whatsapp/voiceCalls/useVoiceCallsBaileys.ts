@@ -1,9 +1,11 @@
+import { Logger } from '@config/logger.config';
 import { ConnectionState, WAConnectionState, WASocket } from 'baileys';
 import { io, Socket } from 'socket.io-client';
 
 import { ClientToServerEvents, ServerToClientEvents } from './transport.type';
 
 let baileys_connection_state: WAConnectionState = 'close';
+const voiceLogger = new Logger('VoiceCallsBaileys');
 
 export const useVoiceCallsBaileys = async (
   wavoip_token: string,
@@ -11,6 +13,18 @@ export const useVoiceCallsBaileys = async (
   status?: WAConnectionState,
   logger?: boolean,
 ) => {
+  const logDebug = (value: any) => {
+    if (logger) {
+      voiceLogger.debug(value);
+    }
+  };
+
+  const logError = (value: any) => {
+    if (logger) {
+      voiceLogger.error(value);
+    }
+  };
+
   baileys_connection_state = status ?? 'close';
 
   const socket: Socket<ServerToClientEvents, ClientToServerEvents> = io('https://devices.wavoip.com/baileys', {
@@ -19,7 +33,7 @@ export const useVoiceCallsBaileys = async (
   });
 
   socket.on('connect', () => {
-    if (logger) console.log('[*] - Wavoip connected', socket.id);
+    logDebug({ local: 'connect', socketId: socket.id });
 
     socket.emit(
       'init',
@@ -30,18 +44,17 @@ export const useVoiceCallsBaileys = async (
   });
 
   socket.on('disconnect', () => {
-    if (logger) console.log('[*] - Wavoip disconnect');
+    logDebug({ local: 'disconnect' });
   });
 
   socket.on('connect_error', (error) => {
     if (socket.active) {
-      if (logger)
-        console.log(
-          '[*] - Wavoip connection error temporary failure, the socket will automatically try to reconnect',
-          error,
-        );
+      logDebug({
+        local: 'connect_error.retrying',
+        error,
+      });
     } else {
-      if (logger) console.log('[*] - Wavoip connection error', error.message);
+      logError({ local: 'connect_error', error });
     }
   });
 
@@ -51,9 +64,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call onWhatsApp function', response, jid);
+      logDebug({ local: 'onWhatsApp.success', response, jid });
     } catch (error) {
-      if (logger) console.error('[*] Error on call onWhatsApp function', error);
+      logError({ local: 'onWhatsApp.error', error });
     }
   });
 
@@ -63,9 +76,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call profilePictureUrl function', response);
+      logDebug({ local: 'profilePictureUrl.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call profilePictureUrl function', error);
+      logError({ local: 'profilePictureUrl.error', error });
     }
   });
 
@@ -75,9 +88,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call assertSessions function', response);
+      logDebug({ local: 'assertSessions.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call assertSessions function', error);
+      logError({ local: 'assertSessions.error', error });
     }
   });
 
@@ -87,9 +100,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response, true);
 
-      if (logger) console.log('[*] Success on call createParticipantNodes function', response);
+      logDebug({ local: 'createParticipantNodes.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call createParticipantNodes function', error);
+      logError({ local: 'createParticipantNodes.error', error });
     }
   });
 
@@ -99,9 +112,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call getUSyncDevices function', response);
+      logDebug({ local: 'getUSyncDevices.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call getUSyncDevices function', error);
+      logError({ local: 'getUSyncDevices.error', error });
     }
   });
 
@@ -111,22 +124,22 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call generateMessageTag function', response);
+      logDebug({ local: 'generateMessageTag.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call generateMessageTag function', error);
+      logError({ local: 'generateMessageTag.error', error });
     }
   });
 
   socket.on('sendNode', async (stanza, callback) => {
     try {
-      console.log('sendNode', JSON.stringify(stanza));
+      logDebug({ local: 'sendNode.request', stanza });
       const response = await baileys_sock.sendNode(stanza);
 
       callback(true);
 
-      if (logger) console.log('[*] Success on call sendNode function', response);
+      logDebug({ local: 'sendNode.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call sendNode function', error);
+      logError({ local: 'sendNode.error', error });
     }
   });
 
@@ -140,9 +153,9 @@ export const useVoiceCallsBaileys = async (
 
       callback(response);
 
-      if (logger) console.log('[*] Success on call signalRepository:decryptMessage function', response);
+      logDebug({ local: 'decryptMessage.success', response });
     } catch (error) {
-      if (logger) console.error('[*] Error on call signalRepository:decryptMessage function', error);
+      logError({ local: 'decryptMessage.error', error });
     }
   });
 
@@ -168,12 +181,12 @@ export const useVoiceCallsBaileys = async (
   });
 
   baileys_sock.ws.on('CB:call', (packet) => {
-    if (logger) console.log('[*] Signling received');
+    logDebug({ local: 'signal.received', packet });
     socket.volatile.timeout(1000).emit('CB:call', packet);
   });
 
   baileys_sock.ws.on('CB:ack,class:call', (packet) => {
-    if (logger) console.log('[*] Signling ack received');
+    logDebug({ local: 'signal.ackReceived', packet });
     socket.volatile.timeout(1000).emit('CB:ack,class:call', packet);
   });
 

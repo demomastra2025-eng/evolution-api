@@ -1,11 +1,14 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { NumberDto } from '@api/dto/chat.dto';
 import { businessController } from '@api/server.module';
+import { Logger } from '@config/logger.config';
 import { createMetaErrorResponse } from '@utils/errorResponse';
 import { catalogSchema, collectionsSchema } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
+
+const logger = new Logger('BusinessRouter');
 
 export class BusinessRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
@@ -22,10 +25,7 @@ export class BusinessRouter extends RouterBroker {
 
           return res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          // Log error for debugging
-          console.error('Business catalog error:', error);
-
-          // Use utility function to create standardized error response
+          logger.error({ local: 'getCatalog', error });
           const errorResponse = createMetaErrorResponse(error, 'business_catalog');
           return res.status(errorResponse.status).json(errorResponse);
         }
@@ -42,10 +42,7 @@ export class BusinessRouter extends RouterBroker {
 
           return res.status(HttpStatus.OK).json(response);
         } catch (error) {
-          // Log error for debugging
-          console.error('Business collections error:', error);
-
-          // Use utility function to create standardized error response
+          logger.error({ local: 'getCollections', error });
           const errorResponse = createMetaErrorResponse(error, 'business_collections');
           return res.status(errorResponse.status).json(errorResponse);
         }

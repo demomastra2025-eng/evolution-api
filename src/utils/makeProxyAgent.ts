@@ -1,3 +1,4 @@
+import { socksDispatcher } from 'fetch-socks';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { ProxyAgent } from 'undici';
@@ -18,12 +19,23 @@ function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProx
   // the end so, we add the protocol constants without the `:` to avoid confusion.
   const PROXY_HTTP_PROTOCOL = 'http:';
   const PROXY_SOCKS_PROTOCOL = 'socks:';
+  const PROXY_SOCKS5_PROTOCOL = 'socks5:';
 
   switch (url.protocol) {
     case PROXY_HTTP_PROTOCOL:
       return new HttpsProxyAgent(url);
     case PROXY_SOCKS_PROTOCOL:
-      return new SocksProxyAgent(url);
+    case PROXY_SOCKS5_PROTOCOL: {
+      let urlSocks = '';
+
+      if (url.username && url.password) {
+        urlSocks = `socks://${url.username}:${url.password}@${url.hostname}:${url.port}`;
+      } else {
+        urlSocks = `socks://${url.hostname}:${url.port}`;
+      }
+
+      return new SocksProxyAgent(urlSocks);
+    }
     default:
       throw new Error(`Unsupported proxy protocol: ${url.protocol}`);
   }
@@ -64,6 +76,8 @@ export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
     proxyUrl = `${protocol}://${auth}${host}:${port}`;
   }
 
+  protocol = protocol.toLowerCase();
+
   const PROXY_HTTP_PROTOCOL = 'http';
   const PROXY_HTTPS_PROTOCOL = 'https';
   const PROXY_SOCKS4_PROTOCOL = 'socks4';
@@ -72,9 +86,24 @@ export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
   switch (protocol) {
     case PROXY_HTTP_PROTOCOL:
     case PROXY_HTTPS_PROTOCOL:
-    case PROXY_SOCKS4_PROTOCOL:
-    case PROXY_SOCKS5_PROTOCOL:
       return new ProxyAgent(proxyUrl);
+
+    case PROXY_SOCKS4_PROTOCOL:
+    case PROXY_SOCKS5_PROTOCOL: {
+      let type: 4 | 5 = 5;
+
+      if (PROXY_SOCKS4_PROTOCOL === protocol) type = 4;
+
+      const url = new URL(proxyUrl);
+
+      return socksDispatcher({
+        type: type,
+        host: url.hostname,
+        port: Number(url.port),
+        userId: url.username || undefined,
+        password: url.password || undefined,
+      });
+    }
 
     default:
       throw new Error(`Unsupported proxy protocol: ${protocol}`);

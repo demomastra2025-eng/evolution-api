@@ -127,12 +127,12 @@ export class KafkaController extends EventController implements EventControllerI
           eachMessage: async ({ topic, message }) => {
             try {
               const data = JSON.parse(message.value?.toString() || '{}');
-              this.logger.debug(`Received message from topic ${topic}: ${JSON.stringify(data)}`);
+              this.logger.debug({ local: 'consumer.eachMessage', topic, data });
 
               // Process the message here if needed
               // This is where you can add custom message processing logic
             } catch (error) {
-              this.logger.error(`Error processing message from topic ${topic}: ${error}`);
+              this.logger.error({ local: 'consumer.eachMessage', topic, error });
             }
           },
         });
@@ -262,6 +262,7 @@ export class KafkaController extends EventController implements EventControllerI
     sender,
     apiKey,
     integration,
+    extra,
   }: EmitData): Promise<void> {
     if (integration && !integration.includes('kafka')) {
       return;
@@ -284,6 +285,7 @@ export class KafkaController extends EventController implements EventControllerI
     const logEnabled = configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS');
 
     const message = {
+      ...(extra ?? {}),
       event,
       instance: instanceName,
       data,

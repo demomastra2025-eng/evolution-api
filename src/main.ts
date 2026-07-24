@@ -26,8 +26,8 @@ import cors from 'cors';
 import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
 import { join } from 'path';
 
-function initWA() {
-  waMonitor.loadInstance();
+async function initWA() {
+  await waMonitor.loadInstance();
 }
 
 async function bootstrap() {
@@ -48,10 +48,16 @@ async function bootstrap() {
     cors({
       origin(requestOrigin, callback) {
         const { ORIGIN } = configService.get<Cors>('CORS');
-        if (ORIGIN.includes('*')) {
+        const allowedOrigins = ORIGIN.map((origin) => origin?.trim()).filter(Boolean);
+
+        // Server-to-server calls omit Origin; allow them explicitly.
+        if (!requestOrigin) {
           return callback(null, true);
         }
-        if (ORIGIN.indexOf(requestOrigin) !== -1) {
+        if (allowedOrigins.includes('*')) {
+          return callback(null, true);
+        }
+        if (allowedOrigins.includes(requestOrigin)) {
           return callback(null, true);
         }
         return callback(new Error('Not allowed by CORS'));
@@ -159,7 +165,9 @@ async function bootstrap() {
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
-  initWA();
+  initWA().catch((error) => {
+    logger.error('Error loading instances: ' + error);
+  });
 
   onUnexpectedError();
 }

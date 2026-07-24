@@ -17,6 +17,7 @@ enum InstanceConnectionStatus {
   open
   close
   connecting
+  reconnecting
 }
 
 enum DeviceMessage {
@@ -70,7 +71,7 @@ model Instance {
   integration             String?                  @db.VarChar(100)
   number                  String?                  @db.VarChar(100)
   businessId              String?                  @db.VarChar(100)
-  token                   String?                  @db.VarChar(255)
+  token                   String?                  @db.VarChar(500)
   clientName              String?                  @db.VarChar(100)
   disconnectionReasonCode Int?                     @db.Integer
   disconnectionObject     Json?                    @db.JsonB
@@ -132,6 +133,7 @@ model Chat {
   instanceId     String
   unreadMessages Int       @default(0)
 
+  @@unique([instanceId, remoteJid])
   @@index([instanceId])
   @@index([remoteJid])
 }

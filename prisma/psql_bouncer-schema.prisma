@@ -18,6 +18,7 @@ enum InstanceConnectionStatus {
   open
   close
   connecting
+  reconnecting
 }
 
 enum DeviceMessage {
@@ -71,7 +72,7 @@ model Instance {
   integration             String?                  @db.VarChar(100)
   number                  String?                  @db.VarChar(100)
   businessId              String?                  @db.VarChar(100)
-  token                   String?                  @db.VarChar(255)
+  token                   String?                  @db.VarChar(500)
   clientName              String?                  @db.VarChar(100)
   disconnectionReasonCode Int?                     @db.Integer
   disconnectionObject     Json?                    @db.JsonB
@@ -133,6 +134,7 @@ model Chat {
   instanceId     String
   unreadMessages Int       @default(0)
 
+  @@unique([instanceId, remoteJid])
   @@index([instanceId])
   @@index([remoteJid])
 }
@@ -402,6 +404,7 @@ model Media {
   fileName   String    @db.VarChar(500)
   type       String    @db.VarChar(100)
   mimetype   String    @db.VarChar(100)
+  fileUrl    String?   @db.VarChar(1000)
   createdAt  DateTime? @default(now()) @db.Date
   Message    Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
   messageId  String    @unique

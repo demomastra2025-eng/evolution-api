@@ -113,13 +113,14 @@ class ChatwootImport {
 
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
+          const isLid = contact.remoteJid.includes('@lid');
 
           const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
           let bindPhoneNumber: string;
-          if (!isGroup) {
+          if (!isGroup && !isLid) {
             bindInsert.push(`+${contact.remoteJid.split('@')[0]}`);
             bindPhoneNumber = `$${bindInsert.length}`;
           } else {
@@ -137,7 +138,7 @@ class ChatwootImport {
                        DO UPDATE SET
                         name = EXCLUDED.name,
                         phone_number = EXCLUDED.phone_number,
-                        identifier = EXCLUDED.identifier`;
+                        updated_at = NOW()`;
 
         totalContactsImported += (await pgClient.query(sqlInsert, bindInsert))?.rowCount ?? 0;
 

@@ -1,0 +1,33 @@
+#
+# Production Docker stack for Evolution API.
+# This stack expects the external SHARED_SERVICES_NETWORK to be the same one used
+# by onelink/docker-compose.production.yaml. On that shared network this service
+# is exported as `evolution-api`, while Onelink exports `chatwoot-postgres` and
+# `chatwoot-redis` for database and Redis reuse.
+#
+services:
+  api:
+    container_name: evolution_api
+    image: ${EVOLUTION_API_IMAGE:-evoapicloud/evolution-api:latest}
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - evolution_instances:/evolution/instances
+    networks:
+      shared-services:
+        aliases:
+          - evolution-api
+    expose:
+      - "8080"
+
+volumes:
+  evolution_instances:
+
+networks:
+  shared-services:
+    # External network shared with onelink/docker-compose.production.yaml.
+    name: ${SHARED_SERVICES_NETWORK:-dokploy-network}
+    external: true

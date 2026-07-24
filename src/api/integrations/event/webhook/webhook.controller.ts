@@ -65,6 +65,7 @@ export class WebhookController extends EventController implements EventControlle
     apiKey,
     local,
     integration,
+    extra,
   }: EmitData): Promise<void> {
     if (integration && !integration.includes('webhook')) {
       return;
@@ -90,6 +91,7 @@ export class WebhookController extends EventController implements EventControlle
     const regex = /^(https?:\/\/)/;
 
     const webhookData = {
+      ...(extra ?? {}),
       event,
       instance: instanceName,
       data,
@@ -111,24 +113,41 @@ export class WebhookController extends EventController implements EventControlle
         }
 
         if (enabledLog) {
-          const logData = {
-            local: `${origin}.sendData-Webhook`,
-            url: baseURL,
-            ...webhookData,
-          };
+          const logData = this.sanitizedLogPayload(`${origin}.sendData-Webhook`, baseURL, webhookData);
 
           this.logger.log(logData);
         }
 
         try {
           if (instance?.enabled && regex.test(instance.url)) {
+            // Add custom headers for better webhook tracking and debugging
+            const enhancedHeaders = {
+              ...webhookHeaders,
+              'Content-Type': 'application/json',
+              'X-Instance-ID': this.monitor.waInstances[instanceName].instanceId,
+              'X-Instance-Name': instanceName,
+              'X-Event-Type': event,
+              'X-Timestamp': Date.now().toString(),
+              'User-Agent': 'EvolutionAPI-Webhook/2.3.7',
+            };
+
             const httpService = axios.create({
               baseURL,
-              headers: webhookHeaders as Record<string, string> | undefined,
+              headers: enhancedHeaders as Record<string, string>,
               timeout: webhookConfig.REQUEST?.TIMEOUT_MS ?? 30000,
             });
 
-            await this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl);
+            await this.retryWebhookRequest(
+              httpService,
+              webhookData,
+              `${origin}.sendData-Webhook`,
+              baseURL,
+              serverUrl,
+              undefined,
+              undefined,
+              instanceName,
+              event,
+            );
           }
         } catch (error) {
           this.logger.error({
@@ -156,11 +175,7 @@ export class WebhookController extends EventController implements EventControlle
         }
 
         if (enabledLog) {
-          const logData = {
-            local: `${origin}.sendData-Webhook-Global`,
-            url: globalURL,
-            ...webhookData,
-          };
+          const logData = this.sanitizedLogPayload(`${origin}.sendData-Webhook-Global`, globalURL, webhookData);
 
           this.logger.log(logData);
         }
@@ -206,6 +221,8 @@ export class WebhookController extends EventController implements EventControlle
     serverUrl: string,
     maxRetries?: number,
     delaySeconds?: number,
+    instanceName?: string,
+    event?: string,
   ): Promise<void> {
     const webhookConfig = configService.get<Webhook>('WEBHOOK');
     const maxRetryAttempts = maxRetries ?? webhookConfig.RETRY?.MAX_ATTEMPTS ?? 10;
@@ -218,6 +235,19 @@ export class WebhookController extends EventController implements EventControlle
     let attempts = 0;
 
     while (attempts < maxRetryAttempts) {
+      if (instanceName && event) {
+        const shouldContinue = await this.shouldContinueLocalWebhookRetry(instanceName, event, baseURL);
+
+        if (!shouldContinue) {
+          this.logger.log({
+            local: `${origin}`,
+            message: `Cancelando retentativas para o instance "${instanceName}" porque o webhook local nao esta mais ativo para este destino`,
+            url: baseURL,
+          });
+          return;
+        }
+      }
+
       try {
         await httpService.post('', webhookData);
         if (attempts > 0) {
@@ -263,6 +293,19 @@ export class WebhookController extends EventController implements EventControlle
           throw error;
         }
 
+        if (instanceName && event) {
+          const shouldContinue = await this.shouldContinueLocalWebhookRetry(instanceName, event, baseURL);
+
+          if (!shouldContinue) {
+            this.logger.log({
+              local: `${origin}`,
+              message: `Cancelando retentativas para o instance "${instanceName}" porque o webhook local nao esta mais ativo para este destino`,
+              url: baseURL,
+            });
+            return;
+          }
+        }
+
         let nextDelay = initialDelay;
         if (useExponentialBackoff) {
           nextDelay = Math.min(initialDelay * Math.pow(2, attempts - 1), maxDelay);
@@ -280,6 +323,95 @@ export class WebhookController extends EventController implements EventControlle
         await new Promise((resolve) => setTimeout(resolve, nextDelay * 1000));
       }
     }
+  }
+
+  private async shouldContinueLocalWebhookRetry(
+    instanceName: string,
+    event: string,
+    baseURL: string,
+  ): Promise<boolean> {
+    const runtimeInstance = this.monitor.waInstances[instanceName];
+    if (!runtimeInstance) {
+      return false;
+    }
+
+    const webhookConfig = (await this.get(instanceName)) as wa.LocalWebHook | null;
+    if (!webhookConfig?.enabled || !webhookConfig?.url) {
+      return false;
+    }
+
+    if (!/^(https?:\/\/)/.test(webhookConfig.url)) {
+      return false;
+    }
+
+    const transformedEvent = event.replace(/[.-]/gm, '_').toUpperCase().replace(/_/gm, '-').toLowerCase();
+    const currentBaseURL = webhookConfig.webhookByEvents
+      ? `${webhookConfig.url}/${transformedEvent}`
+      : webhookConfig.url;
+
+    return currentBaseURL === baseURL;
+  }
+
+  private sanitizedLogPayload(local: string, url: string, webhookData: Record<string, any>) {
+    return {
+      local,
+      url,
+      ...webhookData,
+      data: this.sanitizeWebhookData(webhookData.event, webhookData.data),
+    };
+  }
+
+  private sanitizeWebhookData(event: string, data: any): any {
+    if (event === 'messages.set' && Array.isArray(data)) {
+      return this.summarizeMessagesSet(data);
+    }
+
+    if (Array.isArray(data)) {
+      const sample = data.slice(0, 2).map((entry) => this.redactSensitiveFields(entry));
+
+      return data.length > 2 ? { count: data.length, sample, truncated: true } : sample;
+    }
+
+    return this.redactSensitiveFields(data);
+  }
+
+  private summarizeMessagesSet(data: any[]) {
+    const timestamps = data
+      .map((entry) => Number(entry?.messageTimestamp))
+      .filter((timestamp) => Number.isFinite(timestamp));
+    const messageTypes = [...new Set(data.map((entry) => entry?.messageType).filter(Boolean))].slice(0, 10);
+    const remoteJids = [...new Set(data.map((entry) => entry?.key?.remoteJid).filter(Boolean))].slice(0, 10);
+
+    return {
+      count: data.length,
+      messageTypes,
+      remoteJids,
+      firstTimestamp: timestamps.length > 0 ? Math.min(...timestamps) : undefined,
+      lastTimestamp: timestamps.length > 0 ? Math.max(...timestamps) : undefined,
+      truncated: true,
+    };
+  }
+
+  private redactSensitiveFields(value: any): any {
+    if (!value || typeof value !== 'object') {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.slice(0, 2).map((entry) => this.redactSensitiveFields(entry));
+    }
+
+    const sensitiveKeys = new Set(['mediaKey', 'fileSha256', 'fileEncSha256', 'directPath', 'encHandle', 'base64']);
+
+    return Object.entries(value).reduce<Record<string, any>>((result, [key, entry]) => {
+      if (sensitiveKeys.has(key)) {
+        result[key] = '[REDACTED]';
+      } else {
+        result[key] = this.redactSensitiveFields(entry);
+      }
+
+      return result;
+    }, {});
   }
 
   private generateJwtToken(authToken: string): string {

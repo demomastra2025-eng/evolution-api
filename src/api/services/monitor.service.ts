@@ -38,29 +38,48 @@ export class WAMonitoringService {
 
   private readonly logger = new Logger('WAMonitoringService');
   public readonly waInstances: Record<string, any> = {};
+  private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
 
   private readonly providerSession: ProviderSession;
 
   public delInstanceTime(instance: string) {
     const time = this.configService.get<DelInstance>('DEL_INSTANCE');
     if (typeof time === 'number' && time > 0) {
-      setTimeout(
+      // Clear previous timeout if exists
+      if (this.delInstanceTimeouts[instance]) {
+        clearTimeout(this.delInstanceTimeouts[instance]);
+      }
+
+      // Set new timeout and store reference
+      this.delInstanceTimeouts[instance] = setTimeout(
         async () => {
-          if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
-            if (this.waInstances[instance]?.connectionStatus?.state === 'connecting') {
-              if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
-                await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
-                this.waInstances[instance]?.client?.ws?.close();
-                this.waInstances[instance]?.client?.end(undefined);
+          try {
+            if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
+              if (['connecting', 'reconnecting'].includes(this.waInstances[instance]?.connectionStatus?.state)) {
+                if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
+                  await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
+                  this.waInstances[instance]?.client?.ws?.close();
+                  this.waInstances[instance]?.client?.end(undefined);
+                }
+                this.eventEmitter.emit('remove.instance', instance, 'inner');
+              } else {
+                this.eventEmitter.emit('remove.instance', instance, 'inner');
               }
-              this.eventEmitter.emit('remove.instance', instance, 'inner');
-            } else {
-              this.eventEmitter.emit('remove.instance', instance, 'inner');
             }
+          } finally {
+            // Clean up timeout reference
+            delete this.delInstanceTimeouts[instance];
           }
         },
         1000 * 60 * time,
       );
+    }
+  }
+
+  public clearDelInstanceTime(instance: string) {
+    if (this.delInstanceTimeouts[instance]) {
+      clearTimeout(this.delInstanceTimeouts[instance]);
+      delete this.delInstanceTimeouts[instance];
     }
   }
 
@@ -271,9 +290,23 @@ export class WAMonitoringService {
       token: instanceData.token,
       number: instanceData.number,
       businessId: instanceData.businessId,
+      ownerJid: instanceData.ownerJid,
     });
 
-    await instance.connectToWhatsapp();
+    if (
+      instanceData.connectionStatus === 'open' ||
+      instanceData.connectionStatus === 'connecting' ||
+      instanceData.connectionStatus === 'reconnecting'
+    ) {
+      this.logger.info(
+        `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
+      );
+      await instance.connectToWhatsapp();
+    } else {
+      this.logger.info(
+        `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
+      );
+    }
 
     this.waInstances[instanceData.instanceName] = instance;
   }
@@ -299,6 +332,8 @@ export class WAMonitoringService {
             token: instanceData.token,
             number: instanceData.number,
             businessId: instanceData.businessId,
+            ownerJid: instanceData.ownerJid,
+            connectionStatus: instanceData.connectionStatus as any, // Pass connection status
           };
 
           this.setInstance(instance);
@@ -327,6 +362,8 @@ export class WAMonitoringService {
           token: instance.token,
           number: instance.number,
           businessId: instance.businessId,
+          ownerJid: instance.ownerJid,
+          connectionStatus: instance.connectionStatus as any, // Pass connection status
         });
       }),
     );
@@ -350,7 +387,10 @@ export class WAMonitoringService {
           instanceName: instance.name,
           integration: instance.integration,
           token: instance.token,
+          number: instance.number,
           businessId: instance.businessId,
+          ownerJid: instance.ownerJid,
+          connectionStatus: instance.connectionStatus as any, // Pass connection status
         });
       }),
     );
@@ -361,8 +401,10 @@ export class WAMonitoringService {
       try {
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
-        this.cleaningUp(instanceName);
-        this.cleaningStoreData(instanceName);
+        this.clearDelInstanceTime(instanceName);
+
+        await this.cleaningUp(instanceName);
+        await this.cleaningStoreData(instanceName);
       } finally {
         this.logger.warn(`Instance "${instanceName}" - REMOVED`);
       }
@@ -377,11 +419,13 @@ export class WAMonitoringService {
       try {
         await this.waInstances[instanceName]?.sendDataWebhook(Events.LOGOUT_INSTANCE, null);
 
+        this.clearDelInstanceTime(instanceName);
+
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
           this.waInstances[instanceName]?.clearCacheChatwoot();
         }
 
-        this.cleaningUp(instanceName);
+        await this.cleaningUp(instanceName);
       } finally {
         this.logger.warn(`Instance "${instanceName}" - LOGOUT`);
       }
