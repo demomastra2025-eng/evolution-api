@@ -308,8 +308,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private isDeleting = false; // Flag to prevent reconnection during deletion
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private connectInFlight: Promise<WASocket> | null = null;
+  private reauthenticationInFlight: Promise<WASocket> | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private persistedAuthRegistered: boolean | null = null;
+  private persistedAuthCheckedAt = 0;
+  private readonly persistedAuthCheckTtlMs = 30_000;
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
   private historySyncChatCount = 0;
@@ -1243,31 +1247,112 @@ export class BaileysStartupService extends ChannelStartupService {
     }, 3000);
   }
 
-  public async logoutInstance() {
+  public async logoutInstance({ permanent = false }: { permanent?: boolean } = {}) {
     // Mark instance as deleting to prevent reconnection attempts
     this.isDeleting = true;
     this.endSession = true;
     this.clearScheduledReconnect();
+    await this.waitForConnectionAttemptIdle();
+    await this.waitForEventProcessingIdle();
+
+    const previousClient = this.client;
+    this.client = null;
 
     this.messageProcessor.onDestroy();
 
-    if (this.client) {
+    if (previousClient) {
       try {
-        await this.client.logout('Log out instance: ' + this.instanceName);
+        await previousClient.logout('Log out instance: ' + this.instanceName);
       } catch (error) {
         this.logger.error({ message: 'Error during logout', error });
       }
 
       // Improved socket cleanup
       try {
-        this.client.ws?.close();
-        this.client.end(new Error('Instance logout'));
+        previousClient.ws?.close();
+        previousClient.end(new Error('Instance logout'));
       } catch (error) {
         this.logger.error({ message: 'Error during socket cleanup', error });
       }
     }
 
     await this.clearPersistedAuthState();
+
+    this.instance.authState = undefined;
+    this.instance.qrcode = { count: 0 };
+    this.instance.wuid = null;
+    this.instance.profilePictureUrl = null;
+    this.scannedAuthenticationArtifactAt = null;
+    this.stateConnection = {
+      state: 'close',
+      statusReason: DisconnectReason.loggedOut,
+    };
+    this.isDeleting = permanent;
+  }
+
+  public hasLiveConnection(): boolean {
+    return Boolean(
+      this.stateConnection.state === 'open' &&
+        this.client?.ws?.isOpen &&
+        this.client?.user &&
+        this.instance.authState?.state?.creds?.registered,
+    );
+  }
+
+  private async waitForEventProcessingIdle() {
+    let pending = this.eventProcessingQueue;
+    await pending;
+
+    while (pending !== this.eventProcessingQueue) {
+      pending = this.eventProcessingQueue;
+      await pending;
+    }
+  }
+
+  private async waitForConnectionAttemptIdle() {
+    const pending = this.connectInFlight;
+    if (!pending) {
+      return;
+    }
+
+    try {
+      await pending;
+    } catch {
+      // The lifecycle operation still has to clean up a failed connection attempt.
+    }
+  }
+
+  public async hasDurableLiveConnection(): Promise<boolean> {
+    await this.waitForEventProcessingIdle();
+    if (!this.hasLiveConnection()) {
+      return false;
+    }
+
+    return (await this.hasPersistedAuthenticationCredentials()) === true;
+  }
+
+  public async hasPersistedAuthenticationCredentials(): Promise<boolean | null> {
+    if (Date.now() - this.persistedAuthCheckedAt <= this.persistedAuthCheckTtlMs) {
+      return this.persistedAuthRegistered;
+    }
+
+    try {
+      const authState = await this.defineAuthState();
+      if (!authState) {
+        return null;
+      }
+
+      this.persistedAuthRegistered = Boolean(authState.state.creds.registered);
+      this.persistedAuthCheckedAt = Date.now();
+      return this.persistedAuthRegistered;
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to verify persisted WhatsApp authentication credentials',
+        instanceName: this.instance.name,
+        error: error?.toString?.() ?? String(error),
+      });
+      return null;
+    }
   }
 
   public hasAuthenticationArtifacts(): boolean {
@@ -1306,8 +1391,32 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  public prepareForFreshConnectAttempt() {
+  public async prepareForFreshConnectAttempt() {
     this.initialConnectionRecoveryAttempted = false;
+    const persistedAuthRegistered =
+      this.stateConnection.state === 'open' ? await this.hasPersistedAuthenticationCredentials() : null;
+
+    if (this.stateConnection.state === 'open' && (!this.hasLiveConnection() || persistedAuthRegistered === false)) {
+      this.clearScheduledReconnect();
+      try {
+        this.client?.ws?.close();
+        this.client?.end(new Error('Reset stale open session'));
+      } catch (error) {
+        this.logger.warn({
+          message: 'Failed to cleanup stale open session before reconnect',
+          instanceName: this.instance.name,
+          error: error?.toString?.() ?? String(error),
+        });
+      }
+
+      this.client = null;
+      this.instance.authState = undefined;
+      this.instance.qrcode = { count: 0 };
+      this.scannedAuthenticationArtifactAt = null;
+      this.stateConnection = { state: 'close' };
+      this.endSession = false;
+      this.isDeleting = false;
+    }
 
     if (this.shouldResetEndedUnauthenticatedSession()) {
       this.resetEndedUnauthenticatedSessionForFreshConnect();
@@ -1315,19 +1424,53 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async forceReauthentication(number?: string): Promise<WASocket> {
+    if (this.reauthenticationInFlight) {
+      return this.reauthenticationInFlight;
+    }
+
+    await this.waitForConnectionAttemptIdle();
+    await this.waitForEventProcessingIdle();
+
+    return this.startForceReauthentication(number);
+  }
+
+  private async forceReauthenticationFromEvent(number?: string): Promise<WASocket> {
+    return this.startForceReauthentication(number);
+  }
+
+  private async startForceReauthentication(number?: string): Promise<WASocket> {
+    if (this.reauthenticationInFlight) {
+      return this.reauthenticationInFlight;
+    }
+
+    const operation = this.performForceReauthentication(number);
+    this.reauthenticationInFlight = operation;
+
+    try {
+      return await operation;
+    } finally {
+      if (this.reauthenticationInFlight === operation) {
+        this.reauthenticationInFlight = null;
+      }
+    }
+  }
+
+  private async performForceReauthentication(number?: string): Promise<WASocket> {
     this.logger.warn({
       message: 'Forcing WhatsApp auth recovery after initial close without QR',
       instanceName: this.instance.name,
-      number: number ?? this.phoneNumber ?? this.instance.number ?? null,
     });
 
     this.clearScheduledReconnect();
-    this.endSession = false;
-    this.isDeleting = false;
+    this.endSession = true;
+    this.isDeleting = true;
 
-    if (this.client) {
+    const previousClient = this.client;
+    this.client = null;
+
+    if (previousClient) {
       try {
-        await this.client.logout('Force reauthentication');
+        await previousClient.logout('Force reauthentication');
       } catch (error) {
         this.logger.warn({
           message: 'Force reauthentication logout failed',
@@ -1336,8 +1479,8 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       try {
-        this.client.ws?.close();
-        this.client.end(new Error('Force reauthentication'));
+        previousClient.ws?.close();
+        previousClient.end(new Error('Force reauthentication'));
       } catch (error) {
         this.logger.warn({
           message: 'Force reauthentication socket cleanup failed',
@@ -1348,6 +1491,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     await this.clearPersistedAuthState();
 
+    this.instance.authState = undefined;
     this.instance.qrcode = { count: 0 };
     this.scannedAuthenticationArtifactAt = null;
     this.instance.wuid = null;
@@ -1355,6 +1499,62 @@ export class BaileysStartupService extends ChannelStartupService {
     this.stateConnection = { state: 'close' };
     this.phoneNumber = number ?? this.phoneNumber ?? this.instance.number;
 
+    const persisted = await this.updateInstanceRecord(
+      {
+        connectionStatus: 'close',
+        ownerJid: null,
+        profileName: null,
+        profilePicUrl: null,
+        disconnectionAt: new Date(),
+        disconnectionReasonCode: DisconnectReason.loggedOut,
+      },
+      'reauthorize.close',
+    );
+    if (!persisted) {
+      throw new InternalServerErrorException(`The "${this.instance.name}" instance could not enter reauthorization`);
+    }
+
+    this.endSession = false;
+    this.isDeleting = false;
+    return this.connectToWhatsapp(this.phoneNumber);
+  }
+
+  public async restart(): Promise<WASocket> {
+    this.clearScheduledReconnect();
+    this.endSession = true;
+    this.isDeleting = true;
+    await this.waitForConnectionAttemptIdle();
+    await this.waitForEventProcessingIdle();
+
+    const previousClient = this.client;
+    this.client = null;
+
+    try {
+      previousClient?.ws?.close();
+      previousClient?.end(new Error('restart'));
+    } catch (error) {
+      this.logger.warn({
+        message: 'Failed to cleanup socket before restart',
+        instanceName: this.instance.name,
+        error: error?.toString?.() ?? String(error),
+      });
+    }
+
+    this.stateConnection = { state: 'reconnecting' };
+    const persisted = await this.updateInstanceRecord(
+      {
+        connectionStatus: 'reconnecting',
+        disconnectionAt: new Date(),
+      },
+      'restart.reconnecting',
+    );
+    if (!persisted) {
+      throw new InternalServerErrorException(`The "${this.instance.name}" instance could not restart`);
+    }
+
+    this.stateConnection = { state: 'close' };
+    this.endSession = false;
+    this.isDeleting = false;
     return this.connectToWhatsapp(this.phoneNumber);
   }
 
@@ -1783,6 +1983,9 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    this.persistedAuthRegistered = false;
+    this.persistedAuthCheckedAt = Date.now();
   }
 
   private async tryRecoverInitialConnectionWithoutQr(statusCode?: number): Promise<boolean> {
@@ -1816,7 +2019,7 @@ export class BaileysStartupService extends ChannelStartupService {
           return true;
         }
 
-        await this.forceReauthentication(this.phoneNumber ?? this.instance.number);
+        await this.forceReauthenticationFromEvent(this.phoneNumber ?? this.instance.number);
         return true;
       } catch (error) {
         this.logger.error({
@@ -1897,7 +2100,7 @@ export class BaileysStartupService extends ChannelStartupService {
     this.clearScheduledReconnect();
 
     try {
-      await this.logoutInstance();
+      await this.logoutInstance({ permanent: true });
     } catch (error) {
       this.logger.warn({
         message: 'Failed to logout stale runtime instance after missing record',
@@ -3535,27 +3738,36 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    const eventClient = this.client;
+    const eventAuthState = this.instance.authState;
+    eventClient.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        if (eventClient !== this.client) {
+          return;
+        }
+
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
+            if (eventClient !== this.client) {
+              return;
+            }
 
             if (events.call) {
               const call = events.call[0];
 
               if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
+                eventClient.rejectCall(call.id, call.from);
               }
 
               if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
                 if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+                  call.from = await eventClient.signalRepository.lidMapping.getPNForLID(call.from as string);
                 }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+                const msg = await eventClient.sendMessage(call.from, { text: settings.msgCall });
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                eventClient.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
               }
 
               this.sendDataWebhook(Events.CALL, call);
@@ -3563,10 +3775,18 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['connection.update']) {
               await this.connectionUpdate(events['connection.update']);
+              if (eventClient !== this.client) {
+                return;
+              }
             }
 
             if (events['creds.update']) {
-              this.instance.authState.saveCreds();
+              await eventAuthState.saveCreds();
+              if (eventClient !== this.client) {
+                return;
+              }
+              this.persistedAuthRegistered = Boolean(eventAuthState.state.creds.registered);
+              this.persistedAuthCheckedAt = Date.now();
             }
 
             if (events['messaging-history.set']) {

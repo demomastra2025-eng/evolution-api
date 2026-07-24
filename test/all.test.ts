@@ -11,6 +11,7 @@ const instanceController = readFileSync(
   join(root, 'src/api/controllers/instance.controller.ts'),
   'utf8'
 );
+const instanceRouter = readFileSync(join(root, 'src/api/routes/instance.router.ts'), 'utf8');
 
 function extractBlock(source: string, marker: string, nextMarker: string) {
   const start = source.indexOf(marker);
@@ -23,7 +24,7 @@ function extractBlock(source: string, marker: string, nextMarker: string) {
 const scheduleReconnectBlock = extractBlock(
   baileysService,
   'private scheduleReconnect()',
-  'public async logoutInstance()'
+  'public async logoutInstance'
 );
 
 assert.ok(
@@ -121,18 +122,23 @@ const connectToWhatsappBlock = extractBlock(
 
 assert.match(
   connectToWhatsappBlock,
-  /if \(state == 'connecting'\) \{\s*if \(this\.hasAuthenticationArtifacts\(instance\)\) \{\s*return this\.connectOutcomeResponse\(instanceName, instance\);\s*\}/s,
+  /if \(state == 'connecting'\) \{\s*if \(this\.hasAuthenticationArtifacts\(instance\)\) \{\s*return await this\.connectOutcomeResponse\(instanceName, instance\);\s*\}/s,
   '/instance/connect must return the existing QR/pairing artifact immediately while already connecting'
 );
 assert.match(
   connectToWhatsappBlock,
-  /if \(state == 'close'\) \{\s*if \(this\.hasAuthenticationArtifacts\(instance\)\) \{\s*return this\.connectOutcomeResponse\(instanceName, instance\);\s*\}/s,
+  /if \(state == 'close'\) \{[\s\S]*if \(this\.hasAuthenticationArtifacts\(instance\)\) \{\s*return await this\.connectOutcomeResponse\(instanceName, instance\);\s*\}/,
   '/instance/connect must not start a fresh socket when a close-state instance still has an auth artifact'
+);
+assert.match(
+  connectToWhatsappBlock,
+  /if \(state == 'close'\) \{\s*if \(rawState == 'open'\) \{[\s\S]*await instance\.prepareForFreshConnectAttempt\?\.\(\);[\s\S]*await instance\.connectToWhatsapp\(number\);[\s\S]*return await this\.connectOutcomeResponse\(instanceName, instance\);\s*\}\s*if \(this\.hasAuthenticationArtifacts\(instance\)\)/,
+  'stale-open recovery must replace the socket before returning any retained QR artifact'
 );
 
 const prepareFreshConnectBlock = extractBlock(
   baileysService,
-  'public prepareForFreshConnectAttempt()',
+  'public async prepareForFreshConnectAttempt()',
   'public async forceReauthentication'
 );
 assert.match(
@@ -145,6 +151,10 @@ assert.match(
   /this\.resetEndedUnauthenticatedSessionForFreshConnect\(\)/,
   'fresh connect attempts must clear QR-limit endSession before reconnecting'
 );
+assert.match(prepareFreshConnectBlock, /persistedAuthRegistered === false/);
+assert.match(prepareFreshConnectBlock, /this\.instance\.qrcode = \{ count: 0 \}/);
+assert.match(prepareFreshConnectBlock, /this\.scannedAuthenticationArtifactAt = null/);
+assert.match(connectToWhatsappBlock, /await instance\.prepareForFreshConnectAttempt\?\.\(\)/);
 
 const connectToWhatsappRuntimeBlock = extractBlock(
   baileysService,
@@ -165,6 +175,50 @@ assert.match(
   baileysService,
   /return this\.endSession && !this\.isDeleting && !this\.instance\.wuid;/,
   'only non-deleting unauthenticated ended sessions may be reset for a new QR cycle'
+);
+
+const logoutBlock = extractBlock(
+  baileysService,
+  'public async logoutInstance',
+  'public hasLiveConnection'
+);
+assert.match(logoutBlock, /this\.stateConnection\s*=\s*{\s*state:\s*'close'/s);
+assert.match(logoutBlock, /this\.instance\.authState\s*=\s*undefined/);
+assert.match(logoutBlock, /this\.isDeleting\s*=\s*permanent/);
+
+const restartBlock = extractBlock(baileysService, 'public async restart()', 'public async getProfileName');
+assert.match(restartBlock, /connectionStatus:\s*'reconnecting'/);
+assert.match(restartBlock, /this\.stateConnection\s*=\s*{\s*state:\s*'close'/s);
+assert.match(restartBlock, /return this\.connectToWhatsapp\(this\.phoneNumber\)/);
+
+assert.match(instanceRouter, /routerPath\('reauthorize'\)/);
+assert.match(instanceController, /public async reauthorizeInstance/);
+assert.match(instanceController, /this\.reauthorizationInFlight\.get\(instanceName\)/);
+assert.match(baileysService, /if \(this\.reauthenticationInFlight\) \{/);
+assert.match(instanceController, /this\.runtimeConnectionState\(runtimeInstance\)/);
+assert.match(baileysService, /public async hasPersistedAuthenticationCredentials\(\)/);
+assert.match(instanceController, /hasPersistedAuthenticationCredentials/);
+assert.match(baileysService, /await eventAuthState\.saveCreds\(\)/);
+assert.match(baileysService, /if \(eventClient !== this\.client\) \{\s*return;/s);
+assert.match(baileysService, /public async hasDurableLiveConnection\(\)/);
+assert.match(
+  baileysService,
+  /public async hasDurableLiveConnection\(\)[\s\S]*await this\.waitForEventProcessingIdle\(\)[\s\S]*this\.hasLiveConnection\(\)[\s\S]*hasPersistedAuthenticationCredentials\(\)/
+);
+assert.match(
+  instanceController,
+  /const outcomeStatus = response\.instance\.status;[\s\S]*outcomeStatus !== 'open' && outcomeStatus !== 'qr_ready'/
+);
+assert.match(instanceController, /private readonly lifecycleOperations = new Map<string, Promise<void>>\(\)/);
+assert.match(instanceController, /this\.enqueueLifecycleOperation\(instanceName/);
+assert.match(instanceController, /state === 'close' && rawState !== 'open'/);
+assert.match(logoutBlock, /await this\.waitForEventProcessingIdle\(\)/);
+assert.match(logoutBlock, /const previousClient = this\.client;\s*this\.client = null;/s);
+assert.match(restartBlock, /await this\.waitForEventProcessingIdle\(\)/);
+assert.match(restartBlock, /previousClient\?\.end\(new Error\('restart'\)\)/);
+assert.match(
+  baileysService,
+  /const settings = await this\.findSettings\(\);\s*if \(eventClient !== this\.client\) \{\s*return;/s
 );
 
 console.log('WhatsApp auth lifecycle regression checks passed');

@@ -40,6 +40,27 @@ export class InstanceController {
   private readonly logger = new Logger('InstanceController');
   private static readonly CONNECT_OUTCOME_TIMEOUT_MS = 12000;
   private static readonly CONNECT_OUTCOME_POLL_MS = 500;
+  private readonly reauthorizationInFlight = new Map<string, Promise<unknown>>();
+  private readonly lifecycleOperations = new Map<string, Promise<void>>();
+
+  private async enqueueLifecycleOperation<T>(instanceName: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleOperations.get(instanceName) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    this.lifecycleOperations.set(instanceName, settled);
+
+    try {
+      return await result;
+    } finally {
+      if (this.lifecycleOperations.get(instanceName) === settled) {
+        this.lifecycleOperations.delete(instanceName);
+      }
+    }
+  }
 
   private async cleanupOrphanedRuntime(instanceName: string) {
     this.logger.warn({
@@ -50,7 +71,7 @@ export class InstanceController {
     this.waMonitor.clearDelInstanceTime(instanceName);
 
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      await this.waMonitor.waInstances[instanceName]?.logoutInstance({ permanent: true });
     } catch (error) {
       this.logger.warn({
         message: 'Failed to logout orphaned runtime instance',
@@ -363,17 +384,22 @@ export class InstanceController {
   }
 
   public async connectToWhatsapp({ instanceName, number = null }: InstanceDto) {
+    return this.enqueueLifecycleOperation(instanceName, () => this.performConnectToWhatsapp({ instanceName, number }));
+  }
+
+  private async performConnectToWhatsapp({ instanceName, number = null }: InstanceDto) {
     try {
       const instance = this.waMonitor.waInstances[instanceName] as
         | (wa.Instance & {
             qrCode?: wa.QrCode;
             connectionStatus?: { state?: string; statusReason?: number };
             connectToWhatsapp?: (number?: string) => Promise<unknown>;
-            prepareForFreshConnectAttempt?: () => void;
+            prepareForFreshConnectAttempt?: () => Promise<void>;
             hasAuthenticationArtifacts?: () => boolean;
           })
         | undefined;
-      const state = instance?.connectionStatus?.state;
+      const rawState = instance?.connectionStatus?.state;
+      const state = await this.runtimeConnectionState(instance);
 
       if (!state) {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
@@ -385,26 +411,33 @@ export class InstanceController {
 
       if (state == 'connecting') {
         if (this.hasAuthenticationArtifacts(instance)) {
-          return this.connectOutcomeResponse(instanceName, instance);
+          return await this.connectOutcomeResponse(instanceName, instance);
         }
 
         await this.waitForConnectOutcome(instance);
-        return this.connectOutcomeResponse(instanceName, instance);
+        return await this.connectOutcomeResponse(instanceName, instance);
       }
 
       if (state == 'close') {
-        if (this.hasAuthenticationArtifacts(instance)) {
-          return this.connectOutcomeResponse(instanceName, instance);
+        if (rawState == 'open') {
+          await instance.prepareForFreshConnectAttempt?.();
+          await instance.connectToWhatsapp(number);
+          await this.waitForConnectOutcome(instance);
+          return await this.connectOutcomeResponse(instanceName, instance);
         }
 
-        instance.prepareForFreshConnectAttempt?.();
+        if (this.hasAuthenticationArtifacts(instance)) {
+          return await this.connectOutcomeResponse(instanceName, instance);
+        }
+
+        await instance.prepareForFreshConnectAttempt?.();
         await instance.connectToWhatsapp(number);
         await this.waitForConnectOutcome(instance);
-        return this.connectOutcomeResponse(instanceName, instance);
+        return await this.connectOutcomeResponse(instanceName, instance);
       }
 
       await this.waitForConnectOutcome(instance, 3000);
-      return this.connectOutcomeResponse(instanceName, instance);
+      return await this.connectOutcomeResponse(instanceName, instance);
     } catch (error) {
       this.logger.error(error);
       return { error: true, message: this.errorMessage(error) };
@@ -412,15 +445,20 @@ export class InstanceController {
   }
 
   public async restartInstance({ instanceName }: InstanceDto) {
+    return this.enqueueLifecycleOperation(instanceName, () => this.performRestartInstance({ instanceName }));
+  }
+
+  private async performRestartInstance({ instanceName }: InstanceDto) {
     try {
       const instance = this.waMonitor.waInstances[instanceName];
-      const state = instance?.connectionStatus?.state;
+      const state = await this.runtimeConnectionState(instance);
+      const rawState = instance?.connectionStatus?.state;
 
       if (!state) {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
-      if (state === 'close') {
+      if (state === 'close' && rawState !== 'open') {
         throw new BadRequestException('The "' + instanceName + '" instance is not connected');
       }
       this.logger.info(`Restarting instance: ${instanceName}`);
@@ -429,7 +467,7 @@ export class InstanceController {
         await instance.restart();
         // Wait a bit for the reconnection to be established
         await new Promise((r) => setTimeout(r, 2000));
-        return await this.connectToWhatsapp({
+        return await this.performConnectToWhatsapp({
           instanceName,
           number: instance.phoneNumber || null,
         });
@@ -441,7 +479,7 @@ export class InstanceController {
 
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
-        return await this.connectToWhatsapp({ instanceName });
+        return await this.performConnectToWhatsapp({ instanceName });
       }
 
       return {
@@ -472,12 +510,99 @@ export class InstanceController {
       throw new NotFoundException(`Instance "${instanceName}" not found`);
     }
 
+    const state = await this.runtimeConnectionState(runtimeInstance);
+
     return {
       instance: {
         instanceName: instanceName,
-        state: runtimeInstance.connectionStatus?.state,
+        state,
+        live: state === 'open',
       },
     };
+  }
+
+  public async reauthorizeInstance({ instanceName, number = null }: InstanceDto) {
+    const inFlight = this.reauthorizationInFlight.get(instanceName);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const operation = this.enqueueLifecycleOperation(instanceName, () =>
+      this.performReauthorizeInstance({ instanceName, number }),
+    );
+    this.reauthorizationInFlight.set(instanceName, operation);
+
+    try {
+      return await operation;
+    } finally {
+      if (this.reauthorizationInFlight.get(instanceName) === operation) {
+        this.reauthorizationInFlight.delete(instanceName);
+      }
+    }
+  }
+
+  private async performReauthorizeInstance({ instanceName, number = null }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName] as
+      | (wa.Instance & {
+          phoneNumber?: string;
+          connectionStatus?: { state?: string; statusReason?: number };
+          forceReauthentication?: (number?: string) => Promise<unknown>;
+          qrCode?: wa.QrCode;
+          hasAuthenticationArtifacts?: () => boolean;
+          hasDurableLiveConnection?: () => Promise<boolean>;
+        })
+      | undefined;
+
+    if (!instance || typeof instance.forceReauthentication !== 'function') {
+      throw new BadRequestException(`The "${instanceName}" instance does not support reauthorization`);
+    }
+
+    try {
+      await instance.forceReauthentication(number || instance.phoneNumber || null);
+      await this.waitForConnectOutcome(instance);
+      const response = await this.connectOutcomeResponse(instanceName, instance);
+      const outcomeStatus = response.instance.status;
+
+      if (outcomeStatus !== 'open' && outcomeStatus !== 'qr_ready') {
+        throw new InternalServerErrorException(
+          response.message || 'Authentication artifacts were not generated after reconnect',
+        );
+      }
+
+      return response;
+    } catch (error) {
+      this.logger.error(error);
+      if (error instanceof InternalServerErrorException) {
+        throw error;
+      }
+
+      throw new InternalServerErrorException(this.errorMessage(error));
+    }
+  }
+
+  private async runtimeConnectionState(
+    instance:
+      | (wa.Instance & {
+          connectionStatus?: { state?: string };
+          hasLiveConnection?: () => boolean;
+          hasPersistedAuthenticationCredentials?: () => Promise<boolean | null>;
+        })
+      | undefined,
+  ) {
+    const state = instance?.connectionStatus?.state;
+    if (state === 'open' && typeof instance?.hasLiveConnection === 'function') {
+      const hasLiveConnection = instance.hasLiveConnection();
+      const hasPersistedCredentials =
+        typeof instance.hasPersistedAuthenticationCredentials === 'function'
+          ? await instance.hasPersistedAuthenticationCredentials()
+          : null;
+
+      if (!hasLiveConnection || hasPersistedCredentials === false) {
+        return 'close';
+      }
+    }
+
+    return state;
   }
 
   private hasAuthenticationArtifacts(
@@ -522,6 +647,7 @@ export class InstanceController {
           qrCode?: wa.QrCode;
           connectionStatus?: { state?: string };
           hasAuthenticationArtifacts?: () => boolean;
+          hasDurableLiveConnection?: () => Promise<boolean>;
         })
       | undefined,
     timeoutMs = InstanceController.CONNECT_OUTCOME_TIMEOUT_MS,
@@ -534,29 +660,42 @@ export class InstanceController {
       }
 
       const state = instance.connectionStatus?.state;
-      if (state === 'open' || this.hasAuthenticationArtifacts(instance)) {
+      if (this.hasAuthenticationArtifacts(instance)) {
         return;
+      }
+
+      if (state === 'open') {
+        const hasDurableLiveConnection =
+          typeof instance.hasDurableLiveConnection === 'function' ? await instance.hasDurableLiveConnection() : true;
+        if (hasDurableLiveConnection) {
+          return;
+        }
       }
 
       await delay(InstanceController.CONNECT_OUTCOME_POLL_MS);
     }
   }
 
-  private connectOutcomeResponse(
+  private async connectOutcomeResponse(
     instanceName: string,
     instance:
       | (wa.Instance & {
           qrCode?: wa.QrCode;
           connectionStatus?: { state?: string; statusReason?: number };
           hasAuthenticationArtifacts?: () => boolean;
+          hasDurableLiveConnection?: () => Promise<boolean>;
         })
       | undefined,
   ) {
     const state = instance?.connectionStatus?.state ?? 'close';
     const hasAuthArtifacts = this.hasAuthenticationArtifacts(instance);
     const statusCode = instance?.connectionStatus?.statusReason;
+    const hasDurableLiveConnection =
+      state === 'open' && typeof instance?.hasDurableLiveConnection === 'function'
+        ? await instance.hasDurableLiveConnection()
+        : state === 'open';
 
-    if (state === 'open') {
+    if (hasDurableLiveConnection) {
       return {
         instance: {
           instanceName,
@@ -577,7 +716,7 @@ export class InstanceController {
       };
     }
 
-    const reauthRequired = state === 'close' || statusCode === 401 || statusCode === 428;
+    const reauthRequired = state === 'close' || state === 'open' || statusCode === 401 || statusCode === 428;
     if (reauthRequired) {
       return {
         instance: {
@@ -640,30 +779,49 @@ export class InstanceController {
     return await this.waMonitor.waInstances[instanceName].setPresence(data);
   }
 
-  public async logout({ instanceName }: InstanceDto) {
-    const { instance } = await this.connectionState({ instanceName });
+  public async logout({ instanceName }: InstanceDto, { permanent = false }: { permanent?: boolean } = {}) {
+    return this.enqueueLifecycleOperation(instanceName, () => this.performLogout({ instanceName }, { permanent }));
+  }
 
-    if (instance.state === 'close') {
-      throw new BadRequestException('The "' + instanceName + '" instance is not connected');
-    }
+  private async performLogout({ instanceName }: InstanceDto, { permanent = false }: { permanent?: boolean } = {}) {
+    await this.connectionState({ instanceName });
 
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      await this.waMonitor.waInstances[instanceName]?.logoutInstance({ permanent });
+      await this.prismaRepository.instance.update({
+        where: { name: instanceName },
+        data: {
+          connectionStatus: 'close',
+          ownerJid: null,
+          profileName: null,
+          profilePicUrl: null,
+          disconnectionAt: new Date(),
+        },
+      });
 
-      return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
+      return {
+        status: 'SUCCESS',
+        error: false,
+        instance: { instanceName, state: 'close' },
+        response: { message: 'Instance logged out' },
+      };
     } catch (error) {
       throw new InternalServerErrorException(error.toString());
     }
   }
 
   public async deleteInstance({ instanceName }: InstanceDto) {
-    const { instance } = await this.connectionState({ instanceName });
+    return this.enqueueLifecycleOperation(instanceName, () => this.performDeleteInstance({ instanceName }));
+  }
+
+  private async performDeleteInstance({ instanceName }: InstanceDto) {
+    await this.connectionState({ instanceName });
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
-      if (instance.state === 'connecting' || instance.state === 'reconnecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+      if (waInstances) {
+        await this.performLogout({ instanceName }, { permanent: true });
       }
 
       try {
