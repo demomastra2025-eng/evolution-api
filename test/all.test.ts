@@ -176,6 +176,16 @@ assert.match(
   /return this\.endSession && !this\.isDeleting && !this\.instance\.wuid;/,
   'only non-deleting unauthenticated ended sessions may be reset for a new QR cycle'
 );
+assert.match(
+  baileysService,
+  /tryRecoverInitialConnectionWithoutQr[\s\S]*forceReauthenticationFromEvent\(this\.phoneNumber \?\? this\.instance\.number\)/,
+  'initial QR timeout must be recoverable through the serialized in-place reauthentication path'
+);
+assert.match(
+  baileysService,
+  /const persistedAuthRegistered = await this\.hasPersistedAuthenticationCredentials\(\);\s*if \(persistedAuthRegistered !== false\) \{[\s\S]*return false;\s*\}\s*await this\.forceReauthenticationFromEvent/,
+  'automatic QR recovery must never clear registered or unverifiable persisted credentials'
+);
 
 const logoutBlock = extractBlock(
   baileysService,

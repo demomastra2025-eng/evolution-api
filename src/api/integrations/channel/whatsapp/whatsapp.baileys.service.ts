@@ -2019,6 +2019,17 @@ export class BaileysStartupService extends ChannelStartupService {
           return true;
         }
 
+        const persistedAuthRegistered = await this.hasPersistedAuthenticationCredentials();
+        if (persistedAuthRegistered !== false) {
+          this.logger.warn({
+            message: 'Automatic auth recovery preserved persisted WhatsApp credentials',
+            instanceName: this.instance.name,
+            statusCode,
+            persistedAuthRegistered,
+          });
+          return false;
+        }
+
         await this.forceReauthenticationFromEvent(this.phoneNumber ?? this.instance.number);
         return true;
       } catch (error) {
