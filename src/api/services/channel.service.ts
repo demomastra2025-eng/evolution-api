@@ -440,9 +440,7 @@ export class ChannelStartupService {
     extra?: Record<string, any>,
   ) {
     const serverUrl = this.configService.get<HttpServer>('SERVER').URL;
-    const tzoffset = new Date().getTimezoneOffset() * 60000; //offset in milliseconds
-    const localISOTime = new Date(Date.now() - tzoffset).toISOString();
-    const now = localISOTime;
+    const now = new Date().toISOString();
 
     const expose = this.configService.get<Auth>('AUTHENTICATION').EXPOSE_IN_FETCH_INSTANCES;
 

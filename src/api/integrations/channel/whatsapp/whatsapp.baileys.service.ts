@@ -309,6 +309,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private connectInFlight: Promise<WASocket> | null = null;
   private reauthenticationInFlight: Promise<WASocket> | null = null;
+  private reauthenticationReservationOperationId: string | null = null;
+  private lifecycleOperationId: string | null = null;
+  private lifecycleEventSequence = 0;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private persistedAuthRegistered: boolean | null = null;
@@ -1428,28 +1431,58 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async forceReauthentication(number?: string): Promise<WASocket> {
+  public markReauthorizationPending(operationId: string) {
+    const activeOperationId = this.activeReauthorizationOperationId();
+    if (activeOperationId) {
+      return activeOperationId;
+    }
+
+    if (this.lifecycleOperationId !== operationId) {
+      this.lifecycleEventSequence = 0;
+    }
+    this.lifecycleOperationId = operationId;
+    this.reauthenticationReservationOperationId = operationId;
+    return operationId;
+  }
+
+  public currentLifecycleOperationId() {
+    return this.lifecycleOperationId;
+  }
+
+  public activeReauthorizationOperationId() {
+    return this.reauthenticationInFlight || this.reauthenticationReservationOperationId
+      ? this.lifecycleOperationId
+      : null;
+  }
+
+  public async forceReauthentication(number?: string, operationId?: string): Promise<WASocket> {
     if (this.reauthenticationInFlight) {
       return this.reauthenticationInFlight;
     }
 
-    await this.waitForConnectionAttemptIdle();
-    await this.waitForEventProcessingIdle();
+    this.markReauthorizationPending(operationId ?? cuid());
+    return this.startForceReauthentication(number, true);
+  }
 
+  private async forceReauthenticationFromEvent(number?: string): Promise<WASocket | null> {
+    if (this.reauthenticationInFlight || this.reauthenticationReservationOperationId) {
+      return null;
+    }
+
+    this.markReauthorizationPending(cuid());
     return this.startForceReauthentication(number);
   }
 
-  private async forceReauthenticationFromEvent(number?: string): Promise<WASocket> {
-    return this.startForceReauthentication(number);
-  }
-
-  private async startForceReauthentication(number?: string): Promise<WASocket> {
+  private async startForceReauthentication(number?: string, waitForIdle = false): Promise<WASocket> {
     if (this.reauthenticationInFlight) {
       return this.reauthenticationInFlight;
     }
 
-    const operation = this.performForceReauthentication(number);
+    const operation = waitForIdle
+      ? this.performForceReauthenticationAfterIdle(number)
+      : this.performForceReauthentication(number);
     this.reauthenticationInFlight = operation;
+    this.reauthenticationReservationOperationId = null;
 
     try {
       return await operation;
@@ -1458,6 +1491,12 @@ export class BaileysStartupService extends ChannelStartupService {
         this.reauthenticationInFlight = null;
       }
     }
+  }
+
+  private async performForceReauthenticationAfterIdle(number?: string): Promise<WASocket> {
+    await this.waitForConnectionAttemptIdle();
+    await this.waitForEventProcessingIdle();
+    return this.performForceReauthentication(number);
   }
 
   private async performForceReauthentication(number?: string): Promise<WASocket> {
@@ -1631,7 +1670,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private async emitAuthenticationArtifactScannedUpdate() {
+  private lifecycleOperationMetadata(operationId: string | null) {
+    if (!operationId) {
+      return {};
+    }
+
+    if (operationId !== this.lifecycleOperationId) {
+      return { lifecycleOperationId: operationId };
+    }
+
+    this.lifecycleEventSequence += 1;
+    return {
+      lifecycleOperationId: operationId,
+      lifecycleEventSequence: this.lifecycleEventSequence,
+    };
+  }
+
+  private isCurrentLifecycleOperation(operationId: string | null) {
+    return operationId === this.lifecycleOperationId;
+  }
+
+  private async emitAuthenticationArtifactScannedUpdate(operationId: string | null) {
     this.markAuthenticationArtifactScanned();
 
     this.stateConnection = {
@@ -1650,6 +1709,7 @@ export class BaileysStartupService extends ChannelStartupService {
       status: 'connecting',
       hasQr: false,
       wuid: this.instance.wuid,
+      ...this.lifecycleOperationMetadata(operationId),
     });
 
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -1661,12 +1721,20 @@ export class BaileysStartupService extends ChannelStartupService {
           state: 'connecting',
           status: 'connecting',
           hasQr: false,
+          ...this.lifecycleOperationMetadata(operationId),
         },
       );
     }
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(
+    { qr, connection, lastDisconnect }: Partial<ConnectionState>,
+    lifecycleOperationId: string | null,
+  ) {
+    if (!this.isCurrentLifecycleOperation(lifecycleOperationId)) {
+      return;
+    }
+
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
     this.logger.info({
@@ -1688,13 +1756,18 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
           message: 'QR code limit reached, please login again',
           statusCode: DisconnectReason.badSession,
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
         });
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
             Events.QRCODE_UPDATED,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
+            {
+              message: 'QR code limit reached, please login again',
+              statusCode: DisconnectReason.badSession,
+              ...this.lifecycleOperationMetadata(lifecycleOperationId),
+            },
           );
         }
 
@@ -1705,6 +1778,7 @@ export class BaileysStartupService extends ChannelStartupService {
           wuid: this.instance.wuid,
           profileName: await this.getProfileName(),
           profilePictureUrl: this.instance.profilePictureUrl,
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
         });
 
         this.endSession = true;
@@ -1724,8 +1798,15 @@ export class BaileysStartupService extends ChannelStartupService {
       };
 
       this.instance.qrcode.pairingCode = await this.requestPairingCodeForCurrentQr();
+      if (!this.isCurrentLifecycleOperation(lifecycleOperationId)) {
+        return;
+      }
 
       qrcode.toDataURL(qr, optsQrcode, (error, base64) => {
+        if (!this.isCurrentLifecycleOperation(lifecycleOperationId)) {
+          return;
+        }
+
         if (error) {
           this.logger.error('Qrcode generate failed:' + error.toString());
           return;
@@ -1736,6 +1817,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
           qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
         });
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -1744,6 +1826,7 @@ export class BaileysStartupService extends ChannelStartupService {
             { instanceName: this.instance.name, instanceId: this.instanceId },
             {
               qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+              ...this.lifecycleOperationMetadata(lifecycleOperationId),
             },
           );
         }
@@ -1760,7 +1843,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (!qr && !connection && !this.instance.wuid && (this.instance.qrcode?.count ?? 0) > 0) {
-      await this.emitAuthenticationArtifactScannedUpdate();
+      await this.emitAuthenticationArtifactScannedUpdate(lifecycleOperationId);
     }
 
     if (connection) {
@@ -1790,7 +1873,11 @@ export class BaileysStartupService extends ChannelStartupService {
           return;
         }
 
-        await this.emitInitialConnectionFailure(statusCode, lastDisconnect);
+        await this.emitInitialConnectionFailure(
+          statusCode,
+          lastDisconnect,
+          this.lifecycleOperationId ?? lifecycleOperationId,
+        );
         return;
       }
 
@@ -1825,13 +1912,18 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.CONNECTION_UPDATE, {
           instance: this.instance.name,
           ...this.stateConnection,
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
         });
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
             Events.CONNECTION_UPDATE,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'reconnecting' },
+            {
+              instance: this.instance.name,
+              status: 'reconnecting',
+              ...this.lifecycleOperationMetadata(lifecycleOperationId),
+            },
           );
         }
 
@@ -1845,6 +1937,7 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionAt: new Date(),
           disconnectionReasonCode: statusCode,
           disconnectionObject: JSON.stringify(lastDisconnect),
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
         });
 
         const persisted = await this.updateInstanceRecord(
@@ -1864,7 +1957,11 @@ export class BaileysStartupService extends ChannelStartupService {
           this.chatwootService.eventWhatsapp(
             Events.STATUS_INSTANCE,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
+            {
+              instance: this.instance.name,
+              status: 'closed',
+              ...this.lifecycleOperationMetadata(lifecycleOperationId),
+            },
           );
         }
 
@@ -1872,7 +1969,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
 
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+          instance: this.instance.name,
+          ...this.stateConnection,
+          ...this.lifecycleOperationMetadata(lifecycleOperationId),
+        });
       }
     }
 
@@ -1883,6 +1984,9 @@ export class BaileysStartupService extends ChannelStartupService {
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
+        if (!this.isCurrentLifecycleOperation(lifecycleOperationId)) {
+          return;
+        }
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
       } catch {
         this.instance.profilePictureUrl = null;
@@ -1919,7 +2023,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.chatwootService.eventWhatsapp(
           Events.CONNECTION_UPDATE,
           { instanceName: this.instance.name, instanceId: this.instanceId },
-          { instance: this.instance.name, status: 'open' },
+          {
+            instance: this.instance.name,
+            status: 'open',
+            ...this.lifecycleOperationMetadata(lifecycleOperationId),
+          },
         );
         this.syncChatwootLostMessages();
       }
@@ -1930,6 +2038,7 @@ export class BaileysStartupService extends ChannelStartupService {
         profileName: await this.getProfileName(),
         profilePictureUrl: this.instance.profilePictureUrl,
         ...this.stateConnection,
+        ...this.lifecycleOperationMetadata(lifecycleOperationId),
       });
     }
 
@@ -1939,7 +2048,11 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        ...this.stateConnection,
+        ...this.lifecycleOperationMetadata(lifecycleOperationId),
+      });
     }
   }
 
@@ -2056,6 +2169,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private async emitInitialConnectionFailure(
     statusCode: number | undefined,
     lastDisconnect: Partial<ConnectionState>['lastDisconnect'],
+    lifecycleOperationId: string | null,
   ) {
     this.logger.warn({
       message: 'QR code was not generated after initial connection recovery',
@@ -2077,6 +2191,7 @@ export class BaileysStartupService extends ChannelStartupService {
       disconnectionAt,
       disconnectionReasonCode: statusCode,
       disconnectionObject,
+      ...this.lifecycleOperationMetadata(lifecycleOperationId),
     };
 
     this.sendDataWebhook(Events.STATUS_INSTANCE, payload);
@@ -3757,9 +3872,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private eventHandler() {
     const eventClient = this.client;
     const eventAuthState = this.instance.authState;
+    const eventLifecycleOperationId = this.lifecycleOperationId;
     eventClient.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        if (eventClient !== this.client) {
+        if (eventClient !== this.client || !this.isCurrentLifecycleOperation(eventLifecycleOperationId)) {
           return;
         }
 
@@ -3767,7 +3883,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();
-            if (eventClient !== this.client) {
+            if (eventClient !== this.client || !this.isCurrentLifecycleOperation(eventLifecycleOperationId)) {
               return;
             }
 
@@ -3791,8 +3907,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              await this.connectionUpdate(events['connection.update']);
-              if (eventClient !== this.client) {
+              await this.connectionUpdate(events['connection.update'], eventLifecycleOperationId);
+              if (eventClient !== this.client || !this.isCurrentLifecycleOperation(eventLifecycleOperationId)) {
                 return;
               }
             }
@@ -3800,7 +3916,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (events['creds.update']) {
               Object.assign(eventAuthState.state.creds, events['creds.update']);
               await eventAuthState.saveCreds();
-              if (eventClient !== this.client) {
+              if (eventClient !== this.client || !this.isCurrentLifecycleOperation(eventLifecycleOperationId)) {
                 return;
               }
               this.persistedAuthRegistered = Boolean(eventAuthState.state.creds.registered);

@@ -4,6 +4,7 @@ import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { channelController, eventManager } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
+import { LifecycleOperationRegistry } from '@api/services/lifecycle-operation.registry';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { SettingsService } from '@api/services/settings.service';
 import { Events, Integration, wa } from '@api/types/wa.types';
@@ -40,7 +41,7 @@ export class InstanceController {
   private readonly logger = new Logger('InstanceController');
   private static readonly CONNECT_OUTCOME_TIMEOUT_MS = 12000;
   private static readonly CONNECT_OUTCOME_POLL_MS = 500;
-  private readonly reauthorizationInFlight = new Map<string, Promise<unknown>>();
+  private readonly reauthorizationOperations = new LifecycleOperationRegistry();
   private readonly lifecycleOperations = new Map<string, Promise<void>>();
 
   private async enqueueLifecycleOperation<T>(instanceName: string, operation: () => Promise<T>): Promise<T> {
@@ -495,7 +496,9 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
-    const runtimeInstance = this.waMonitor.waInstances[instanceName];
+    const runtimeInstance = this.waMonitor.waInstances[instanceName] as
+      | (wa.Instance & { currentLifecycleOperationId?: () => string | null })
+      | undefined;
     const persistedInstance = await this.prismaRepository.instance.findFirst({
       where: { name: instanceName },
       select: { id: true },
@@ -510,43 +513,77 @@ export class InstanceController {
       throw new NotFoundException(`Instance "${instanceName}" not found`);
     }
 
-    const state = await this.runtimeConnectionState(runtimeInstance);
+    const pendingReauthorization = this.reauthorizationOperations.get(instanceName);
+    const state = pendingReauthorization ? 'reauthorizing' : await this.runtimeConnectionState(runtimeInstance);
+    const lifecycleOperationId =
+      pendingReauthorization?.operationId ?? runtimeInstance.currentLifecycleOperationId?.() ?? undefined;
 
     return {
       instance: {
         instanceName: instanceName,
         state,
         live: state === 'open',
+        lifecycleOperationId,
       },
     };
   }
 
-  public async reauthorizeInstance({ instanceName, number = null }: InstanceDto) {
-    const inFlight = this.reauthorizationInFlight.get(instanceName);
-    if (inFlight) {
-      return inFlight;
+  public async reauthorizeInstance({ instanceName, number = null, lifecycleOperationId }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName] as
+      | (wa.Instance & {
+          forceReauthentication?: (number?: string, operationId?: string) => Promise<unknown>;
+          markReauthorizationPending?: (operationId: string) => string;
+          activeReauthorizationOperationId?: () => string | null;
+        })
+      | undefined;
+
+    if (!instance || typeof instance.forceReauthentication !== 'function') {
+      throw new BadRequestException(`The "${instanceName}" instance does not support reauthorization`);
     }
 
-    const operation = this.enqueueLifecycleOperation(instanceName, () =>
-      this.performReauthorizeInstance({ instanceName, number }),
+    const activeOperationId = instance.activeReauthorizationOperationId?.();
+    const acceptance = this.reauthorizationOperations.start(
+      instanceName,
+      (operationId) =>
+        this.enqueueLifecycleOperation(instanceName, () =>
+          this.performReauthorizeInstance({ instanceName, number, lifecycleOperationId: operationId }),
+        ),
+      {
+        operationId: activeOperationId ?? lifecycleOperationId,
+        onFailure: (error, operationId) => {
+          this.logger.error({
+            message: 'Asynchronous WhatsApp reauthorization failed',
+            instanceName,
+            lifecycleOperationId: operationId,
+            error: this.errorMessage(error),
+          });
+        },
+      },
     );
-    this.reauthorizationInFlight.set(instanceName, operation);
-
-    try {
-      return await operation;
-    } finally {
-      if (this.reauthorizationInFlight.get(instanceName) === operation) {
-        this.reauthorizationInFlight.delete(instanceName);
-      }
+    if (!acceptance.deduplicated) {
+      instance.markReauthorizationPending?.(acceptance.operationId);
     }
+
+    return {
+      accepted: true,
+      deduplicated: acceptance.deduplicated,
+      lifecycleOperationId: acceptance.operationId,
+      startedAt: acceptance.startedAt,
+      instance: {
+        instanceName,
+        state: 'reauthorizing',
+        status: 'reauthorizing',
+        lifecycleOperationId: acceptance.operationId,
+      },
+    };
   }
 
-  private async performReauthorizeInstance({ instanceName, number = null }: InstanceDto) {
+  private async performReauthorizeInstance({ instanceName, number = null, lifecycleOperationId }: InstanceDto) {
     const instance = this.waMonitor.waInstances[instanceName] as
       | (wa.Instance & {
           phoneNumber?: string;
           connectionStatus?: { state?: string; statusReason?: number };
-          forceReauthentication?: (number?: string) => Promise<unknown>;
+          forceReauthentication?: (number?: string, operationId?: string) => Promise<unknown>;
           qrCode?: wa.QrCode;
           hasAuthenticationArtifacts?: () => boolean;
           hasDurableLiveConnection?: () => Promise<boolean>;
@@ -558,7 +595,7 @@ export class InstanceController {
     }
 
     try {
-      await instance.forceReauthentication(number || instance.phoneNumber || null);
+      await instance.forceReauthentication(number || instance.phoneNumber || null, lifecycleOperationId);
       await this.waitForConnectOutcome(instance);
       const response = await this.connectOutcomeResponse(instanceName, instance);
       const outcomeStatus = response.instance.status;
